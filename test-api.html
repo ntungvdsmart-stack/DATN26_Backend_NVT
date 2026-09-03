@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test API</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #eee; }
+        button { padding: 10px 20px; margin: 5px; cursor: pointer; font-size: 16px; border: none; border-radius: 8px; }
+        .btn-login { background: #0f3460; color: white; }
+        .btn-register { background: #533483; color: white; }
+        .btn-admin { background: #e94560; color: white; }
+        pre { background: #16213e; padding: 15px; border-radius: 8px; white-space: pre-wrap; max-height: 300px; overflow: auto; }
+        h1 { color: #e94560; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 8px; font-weight: bold; }
+        .ok { background: #1b4332; color: #95d5b2; }
+        .fail { background: #5c1010; color: #ff9999; }
+    </style>
+</head>
+<body>
+    <h1>🧪 Test API Backend - FashionOS</h1>
+    <p>File này gọi thẳng API từ trình duyệt (không qua React) để kiểm tra Backend.</p>
+    
+    <div>
+        <button class="btn-admin" onclick="testBase()">1. Test kết nối Backend</button>
+        <button class="btn-register" onclick="testRegister()">2. Test Đăng ký</button>
+        <button class="btn-login" onclick="testLoginCustomer()">3. Test Đăng nhập KH</button>
+        <button class="btn-admin" onclick="testLoginAdmin()">4. Test Đăng nhập Admin</button>
+    </div>
+    
+    <div id="status"></div>
+    <h3>📋 Response từ Server:</h3>
+    <pre id="output">Chưa có request nào...</pre>
+
+    <script>
+        const API = 'http://localhost:5000';
+        const output = document.getElementById('output');
+        const status = document.getElementById('status');
+
+        function showResult(label, data, isOk) {
+            output.textContent = `[${label}]\n` + JSON.stringify(data, null, 2);
+            status.className = 'status ' + (isOk ? 'ok' : 'fail');
+            status.textContent = isOk ? '✅ THÀNH CÔNG' : '❌ THẤT BẠI';
+        }
+
+        async function testBase() {
+            try {
+                const res = await fetch(API + '/');
+                const data = await res.json();
+                showResult('Test kết nối', data, true);
+            } catch (e) {
+                showResult('Test kết nối', { error: e.message }, false);
+            }
+        }
+
+        async function testRegister() {
+            try {
+                const res = await fetch(API + '/api/auth/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        full_name: 'Test User',
+                        email: 'testuser_' + Date.now() + '@gmail.com',
+                        password: '123456'
+                    })
+                });
+                const data = await res.json();
+                showResult('Đăng ký', data, data.success);
+            } catch (e) {
+                showResult('Đăng ký', { error: e.message }, false);
+            }
+        }
+
+        async function testLoginCustomer() {
+            try {
+                const res = await fetch(API + '/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        email: 'test@gmail.com',
+                        password: '123456'
+                    })
+                });
+                const data = await res.json();
+                showResult('Đăng nhập KH', data, data.success);
+            } catch (e) {
+                showResult('Đăng nhập KH', { error: e.message }, false);
+            }
+        }
+
+        async function testLoginAdmin() {
+            try {
+                const res = await fetch(API + '/api/auth/login-staff', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: 'admin@gmail.com',
+                        password: 'admin123'
+                    })
+                });
+                const data = await res.json();
+                showResult('Đăng nhập Admin', data, data.success);
+            } catch (e) {
+                showResult('Đăng nhập Admin', { error: e.message }, false);
+            }
+        }
+    </script>
+</body>
+</html>
