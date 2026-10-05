@@ -35,7 +35,7 @@ const ProductModel = {
         const product = products[0];
 
         const [variants] = await pool.query(`
-            SELECT v.variant_id, v.sku, v.price, v.is_active,
+            SELECT v.variant_id, v.sku, v.price, v.is_active, v.size_description,
                    s.size_id, s.size_value,
                    c.color_id, c.color_name, c.hex_code,
                    m.material_id, m.material_name,
@@ -90,7 +90,7 @@ const ProductModel = {
         const product = products[0];
 
         const [variants] = await pool.query(`
-            SELECT v.variant_id, v.sku, v.price,
+            SELECT v.variant_id, v.sku, v.price, v.size_description,
                    s.size_id, s.size_value,
                    c.color_id, c.color_name, c.hex_code,
                    m.material_id, m.material_name,
@@ -117,31 +117,45 @@ const ProductModel = {
     },
 
     // 3. Tạo sản phẩm mới (Transaction)
-    create: async (productData, variantsData, imagesData, accountId) => {
+    create: async (productData, variantsData, imagesData, accountId, branchId) => {
         const connection = await pool.getConnection();
         try {
             await connection.beginTransaction();
 
-            const { product_name, description, category_id, brand_id, base_price, is_active = 1 } = productData;
+            const { product_name, description, category_id, brand_id, base_price, is_active = 1, size_guide_image_url } = productData;
             const [productResult] = await connection.query(
-                'INSERT INTO products (product_name, description, category_id, brand_id, base_price, is_active) VALUES (?, ?, ?, ?, ?, ?)',
-                [product_name, description, category_id, brand_id || null, base_price, is_active]
+                'INSERT INTO products (product_name, description, category_id, brand_id, base_price, is_active, size_guide_image_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [product_name, description, category_id, brand_id || null, base_price, is_active, size_guide_image_url || null]
             );
             const productId = productResult.insertId;
 
-            const MAIN_BRANCH_ID = 1;
+            const targetBranchId = branchId || 1;
             for (const variant of variantsData) {
+                // Tạo SKU tự động nếu không truyền
                 const sku = variant.sku || `SKU-${productId}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+                
                 const [variantResult] = await connection.query(
-                    'INSERT INTO product_variants (product_id, sku, size_id, color_id, material_id, price) VALUES (?, ?, ?, ?, ?, ?)',
-                    [productId, sku, variant.size_id || null, variant.color_id || null, variant.material_id || null, variant.price || base_price]
+                    'INSERT INTO product_variants (product_id, sku, size_id, size_description, color_id, material_id, price) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    [productId, sku, variant.size_id || null, variant.size_description || null, variant.color_id || null, variant.material_id || null, variant.price || base_price]
                 );
+                
                 const variantId = variantResult.insertId;
+                variant.variant_id = variantId;
+
+                // Lưu ảnh riêng cho biến thể nếu có
+                if (variant.image_url && variant.image_url.trim() !== '') {
+                    await connection.query(
+                        'INSERT INTO product_images (product_id, variant_id, image_url, is_primary) VALUES (?, ?, ?, 0)',
+                        [productId, variantId, variant.image_url]
+                    );
+                }
+
+                // Khởi tạo tồn kho
                 const quantity = variant.quantity || 0;
                 if (quantity > 0) {
                     await connection.query(
                         'INSERT INTO inventory (variant_id, branch_id, quantity) VALUES (?, ?, ?)',
-                        [variantId, MAIN_BRANCH_ID, quantity]
+                        [variantId, targetBranchId, quantity]
                     );
                 }
             }
@@ -149,9 +163,14 @@ const ProductModel = {
             if (imagesData && imagesData.length > 0) {
                 for (let i = 0; i < imagesData.length; i++) {
                     const img = imagesData[i];
+                    let targetVariantId = img.variant_id || null;
+                    if (!targetVariantId && img.color_id) {
+                        const match = variantsData.find(v => String(v.color_id) === String(img.color_id));
+                        if (match) targetVariantId = match.variant_id;
+                    }
                     await connection.query(
-                        'INSERT INTO product_images (product_id, image_url, is_primary, sort_order) VALUES (?, ?, ?, ?)',
-                        [productId, img.url, img.is_primary ? 1 : (i === 0 ? 1 : 0), i]
+                        'INSERT INTO product_images (product_id, variant_id, image_url, is_primary, sort_order) VALUES (?, ?, ?, ?, ?)',
+                        [productId, targetVariantId, img.url, img.is_primary ? 1 : (i === 0 ? 1 : 0), i]
                     );
                 }
             }
@@ -171,53 +190,54 @@ const ProductModel = {
         }
     },
 
-    // 4. Cập nhật thông tin cơ bản sản phẩm + đồng bộ variants & images (Transaction)
-    update: async (productId, productData, variantsData, imagesData, accountId) => {
+    // 4. Cập nhật sản phẩm (Transaction)
+    update: async (productId, productData, variantsData, imagesData, accountId, branchId) => {
         const connection = await pool.getConnection();
         try {
             await connection.beginTransaction();
 
             // 4.1 Update thông tin cơ bản
-            const { product_name, description, category_id, brand_id, base_price, is_active } = productData;
+            const { product_name, description, category_id, brand_id, base_price, is_active, size_guide_image_url } = productData;
             await connection.query(
                 `UPDATE products SET 
                     product_name = ?, description = ?, category_id = ?,
-                    brand_id = ?, base_price = ?, is_active = ?
+                    brand_id = ?, base_price = ?, is_active = ?, size_guide_image_url = ?
                  WHERE product_id = ?`,
-                [product_name, description, category_id, brand_id || null, base_price, is_active ?? 1, productId]
+                [product_name, description, category_id, brand_id || null, base_price, is_active ?? 1, size_guide_image_url || null, productId]
             );
 
             // 4.2 Xử lý variants: upsert từng variant
             if (variantsData && variantsData.length > 0) {
-                const MAIN_BRANCH_ID = 1;
+                const targetBranchId = branchId || 1;
                 for (const variant of variantsData) {
                     if (variant.variant_id) {
                         // Variant đã tồn tại → UPDATE
                         await connection.query(
-                            `UPDATE product_variants SET sku = ?, size_id = ?, color_id = ?, material_id = ?, price = ?
+                            `UPDATE product_variants SET sku = ?, size_id = ?, size_description = ?, color_id = ?, material_id = ?, price = ?
                              WHERE variant_id = ? AND product_id = ?`,
-                            [variant.sku, variant.size_id || null, variant.color_id || null,
+                            [variant.sku, variant.size_id || null, variant.size_description || null, variant.color_id || null,
                              variant.material_id || null, variant.price, variant.variant_id, productId]
                         );
                         // Cập nhật tồn kho
                         await connection.query(
                             `INSERT INTO inventory (variant_id, branch_id, quantity) VALUES (?, ?, ?)
                              ON DUPLICATE KEY UPDATE quantity = ?`,
-                            [variant.variant_id, MAIN_BRANCH_ID, variant.quantity ?? 0, variant.quantity ?? 0]
+                            [variant.variant_id, targetBranchId, variant.quantity ?? 0, variant.quantity ?? 0]
                         );
                     } else {
                         // Variant mới → INSERT
                         const sku = variant.sku || `SKU-${productId}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
                         const [vRes] = await connection.query(
-                            'INSERT INTO product_variants (product_id, sku, size_id, color_id, material_id, price) VALUES (?, ?, ?, ?, ?, ?)',
-                            [productId, sku, variant.size_id || null, variant.color_id || null, variant.material_id || null, variant.price || base_price]
+                            'INSERT INTO product_variants (product_id, sku, size_id, size_description, color_id, material_id, price) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                            [productId, sku, variant.size_id || null, variant.size_description || null, variant.color_id || null, variant.material_id || null, variant.price || base_price]
                         );
                         const newVariantId = vRes.insertId;
+                        variant.variant_id = newVariantId;
                         const quantity = variant.quantity || 0;
                         if (quantity > 0) {
                             await connection.query(
                                 'INSERT INTO inventory (variant_id, branch_id, quantity) VALUES (?, ?, ?)',
-                                [newVariantId, MAIN_BRANCH_ID, quantity]
+                                [newVariantId, targetBranchId, quantity]
                             );
                         }
                     }
@@ -230,9 +250,14 @@ const ProductModel = {
                 if (imagesData.length > 0) {
                     for (let i = 0; i < imagesData.length; i++) {
                         const img = imagesData[i];
+                        let targetVariantId = img.variant_id || null;
+                        if (!targetVariantId && img.color_id) {
+                            const match = variantsData.find(v => String(v.color_id) === String(img.color_id));
+                            if (match) targetVariantId = match.variant_id;
+                        }
                         await connection.query(
-                            'INSERT INTO product_images (product_id, image_url, is_primary, sort_order) VALUES (?, ?, ?, ?)',
-                            [productId, img.url, img.is_primary ? 1 : (i === 0 ? 1 : 0), i]
+                            'INSERT INTO product_images (product_id, variant_id, image_url, is_primary, sort_order) VALUES (?, ?, ?, ?, ?)',
+                            [productId, targetVariantId, img.url, img.is_primary ? 1 : (i === 0 ? 1 : 0), i]
                         );
                     }
                 }

@@ -3,8 +3,14 @@ const router = express.Router();
 const AccountController = require('../controllers/accountController');
 const { protect, authorize } = require('../middlewares/authMiddleware');
 
-// TẤT CẢ các route trong file này đều yêu cầu Đăng nhập (protect) và có Quyền Admin (authorize('admin'))
+// TẤT CẢ các route dưới đây yêu cầu Đăng nhập (protect)
 router.use(protect);
+
+// Route cho bản thân (staff/admin)
+router.get('/me', AccountController.getMe);
+router.put('/me', AccountController.updateMe);
+
+// Các route quản trị cần quyền Admin
 router.use(authorize('admin'));
 
 // Lấy danh sách tài khoản

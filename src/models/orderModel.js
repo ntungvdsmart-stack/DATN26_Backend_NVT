@@ -7,11 +7,10 @@ const OrderModel = {
         try {
             await connection.beginTransaction();
 
-            // 1.1 Tính toán tổng tiền lại từ DB để bảo mật (chống sửa giá ở client)
+            // 1.1 Tính toán giá & thu thập items
             let subtotal = 0;
             const validItems = [];
             for (const item of itemsData) {
-                // Lấy giá hiện tại từ DB
                 const [variants] = await connection.query(
                     'SELECT price, product_id FROM product_variants WHERE variant_id = ?',
                     [item.variant_id]
@@ -24,24 +23,70 @@ const OrderModel = {
                     variant_id: item.variant_id,
                     quantity: qty,
                     unit_price: price,
-                    line_discount: 0 // Tương lai có thể thêm
+                    line_discount: 0
                 });
+            }
 
-                // Kiểm tra tồn kho
-                const MAIN_BRANCH_ID = 1;
+            // 1.1.5 Thuật toán Smart Routing: Tìm chi nhánh tối ưu để giao đơn Online
+            // Lấy danh sách các chi nhánh đang hoạt động
+            let branchesQuery = 'SELECT branch_id FROM branches WHERE is_active = 1 ORDER BY branch_id = 1 DESC';
+            let branchesParams = [];
+            
+            // Nếu có tọa độ khách hàng, ưu tiên tìm chi nhánh gần nhất (Smart Routing theo vị trí)
+            if (orderData.shipping_latitude && orderData.shipping_longitude) {
+                // Công thức Haversine để tính khoảng cách
+                branchesQuery = `
+                    SELECT branch_id, 
+                    ( 6371 * acos( cos( radians(?) ) * cos( radians( latitude ) ) 
+                    * cos( radians( longitude ) - radians(?) ) + sin( radians(?) ) 
+                    * sin( radians( latitude ) ) ) ) AS distance 
+                    FROM branches 
+                    WHERE is_active = 1 
+                    ORDER BY distance ASC
+                `;
+                branchesParams = [orderData.shipping_latitude, orderData.shipping_longitude, orderData.shipping_latitude];
+            }
+
+            const [branches] = await connection.query(branchesQuery, branchesParams);
+            let selectedBranchId = null;
+
+            for (const branch of branches) {
+                let hasEnough = true;
+                for (const item of validItems) {
+                    const [inv] = await connection.query(
+                        'SELECT quantity FROM inventory WHERE variant_id = ? AND branch_id = ?',
+                        [item.variant_id, branch.branch_id]
+                    );
+                    const stock = inv.length > 0 ? Number(inv[0].quantity) : 0;
+                    if (stock < item.quantity) {
+                        hasEnough = false;
+                        break;
+                    }
+                }
+                // Nếu chi nhánh này có đủ tất cả các món trong giỏ hàng
+                if (hasEnough) {
+                    selectedBranchId = branch.branch_id;
+                    break;
+                }
+            }
+
+            if (!selectedBranchId) {
+                throw new Error('Rất tiếc, hiện tại không có chi nhánh nào đủ hàng cho toàn bộ sản phẩm trong giỏ của bạn. Vui lòng giảm số lượng hoặc chia nhỏ đơn hàng.');
+            }
+
+            // 1.1.6 Trừ tồn kho tại chi nhánh đã chọn (Dùng FOR UPDATE để tránh race condition)
+            for (const item of validItems) {
                 const [inv] = await connection.query(
                     'SELECT quantity FROM inventory WHERE variant_id = ? AND branch_id = ? FOR UPDATE',
-                    [item.variant_id, MAIN_BRANCH_ID]
+                    [item.variant_id, selectedBranchId]
                 );
                 const currentStock = inv.length > 0 ? Number(inv[0].quantity) : 0;
-                if (currentStock < qty) {
-                    throw new Error(`Sản phẩm variant_id = ${item.variant_id} không đủ tồn kho`);
+                if (currentStock < item.quantity) {
+                    throw new Error(`Sản phẩm variant_id = ${item.variant_id} vừa hết hàng tại chi nhánh xử lý.`);
                 }
-
-                // Trừ tồn kho
                 await connection.query(
                     'UPDATE inventory SET quantity = quantity - ? WHERE variant_id = ? AND branch_id = ?',
-                    [qty, item.variant_id, MAIN_BRANCH_ID]
+                    [item.quantity, item.variant_id, selectedBranchId]
                 );
             }
 
@@ -54,14 +99,24 @@ const OrderModel = {
             const [orderResult] = await connection.query(
                 `INSERT INTO orders (
                     order_code, channel, customer_id, branch_id, staff_id, order_status, 
-                    subtotal_amount, discount_amount, total_amount, shipping_address_snapshot
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    subtotal_amount, discount_amount, total_amount, shipping_address_snapshot,
+                    shipping_latitude, shipping_longitude
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
-                    orderCode, 'online', orderData.customer_id || null, null, null, 'pending',
-                    subtotal, discount, total, orderData.shipping_address_snapshot || ''
+                    orderCode, 'online', orderData.customer_id || null, selectedBranchId, null, 'pending',
+                    subtotal, discount, total, orderData.shipping_address_snapshot || '',
+                    orderData.shipping_latitude || null, orderData.shipping_longitude || null
                 ]
             );
             const orderId = orderResult.insertId;
+
+            // 1.2.1 Insert Promotion Usage if any
+            if (orderData.promotion_id && discount > 0) {
+                await connection.query(
+                    'INSERT INTO order_promotions (order_id, promotion_id, discount_applied) VALUES (?, ?, ?)',
+                    [orderId, orderData.promotion_id, discount]
+                );
+            }
 
             // 1.3 Tạo Order Items
             for (const vItem of validItems) {
@@ -126,12 +181,14 @@ const OrderModel = {
 
             // Nếu hủy đơn hàng, cộng lại tồn kho
             if (newStatus === 'cancelled' && currentStatus !== 'cancelled') {
-                const MAIN_BRANCH_ID = 1;
+                const [orderInfo] = await connection.query('SELECT branch_id FROM orders WHERE order_id = ?', [orderId]);
+                const targetBranchId = orderInfo[0].branch_id || 1;
+                
                 const [items] = await connection.query('SELECT variant_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
                 for (const item of items) {
                     await connection.query(
                         'UPDATE inventory SET quantity = quantity + ? WHERE variant_id = ? AND branch_id = ?',
-                        [item.quantity, item.variant_id, MAIN_BRANCH_ID]
+                        [item.quantity, item.variant_id, targetBranchId]
                     );
                 }
             }
@@ -150,6 +207,32 @@ const OrderModel = {
                 [orderId, newStatus, accountId, note || `Đổi trạng thái thành ${newStatus}`]
             );
 
+            // Gửi thông báo cho khách hàng
+            const [orderDataForNotif] = await connection.query('SELECT order_code, customer_id FROM orders WHERE order_id = ?', [orderId]);
+            if (orderDataForNotif.length > 0 && orderDataForNotif[0].customer_id) {
+                const orderCode = orderDataForNotif[0].order_code;
+                const customerId = orderDataForNotif[0].customer_id;
+                let notifContent = `Đơn hàng ${orderCode} của bạn đã được cập nhật trạng thái: ${newStatus}`;
+                
+                const statusMap = {
+                    'confirmed': 'đã được xác nhận',
+                    'processing': 'đang được xử lý',
+                    'shipping': 'đang được giao đến bạn',
+                    'completed': 'đã giao thành công',
+                    'cancelled': 'đã bị hủy',
+                    'returned': 'đã hoàn trả'
+                };
+                
+                if (statusMap[newStatus]) {
+                    notifContent = `Đơn hàng ${orderCode} của bạn ${statusMap[newStatus]}.`;
+                }
+
+                await connection.query(
+                    `INSERT INTO notifications (customer_id, notif_type, content, related_order_id, is_read) VALUES (?, ?, ?, ?, 0)`,
+                    [customerId, 'order_status', notifContent, orderId]
+                );
+            }
+
             await connection.commit();
             return true;
         } catch (error) {
@@ -158,6 +241,21 @@ const OrderModel = {
         } finally {
             connection.release();
         }
+    },
+
+    // 4. Tìm đơn hàng theo Order Code (Tra cứu)
+    findByOrderCode: async (orderCode) => {
+        const [rows] = await pool.query(`
+            SELECT 
+                o.order_id, o.order_code, o.channel, o.order_status, 
+                o.subtotal_amount, o.discount_amount, o.total_amount, 
+                o.shipping_address_snapshot, o.created_at,
+                c.full_name as customer_name
+            FROM orders o
+            LEFT JOIN customers c ON o.customer_id = c.customer_id
+            WHERE o.order_code = ?
+        `, [orderCode]);
+        return rows.length > 0 ? rows[0] : null;
     }
 };
 

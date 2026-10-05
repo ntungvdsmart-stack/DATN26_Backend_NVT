@@ -23,19 +23,18 @@ const AccountController = {
     // 2. Tạo tài khoản mới (Chỉ Admin)
     createAccount: async (req, res, next) => {
         try {
-            const { username, full_name, email, phone, password, role_id } = req.body;
+            const { full_name, email, phone, password, role_id, branch_id } = req.body;
 
             // Validate cơ bản
-            if (!username || !full_name || !email || !password || !role_id) {
-                return sendResponse(res, 400, false, 'Vui lòng cung cấp đầy đủ thông tin bắt buộc (username, full_name, email, password, role_id)');
+            if (!full_name || !email || !password || !role_id) {
+                return sendResponse(res, 400, false, 'Vui lòng cung cấp đầy đủ thông tin bắt buộc (full_name, email, password, role_id)');
             }
 
-            // Kiểm tra trùng username hoặc email
-            const existingAccount = await AccountModel.findByEmailOrUsername(email);
-            const existingUsername = await AccountModel.findByEmailOrUsername(username);
+            // Kiểm tra trùng email
+            const existingAccount = await AccountModel.findByEmail(email);
 
-            if (existingAccount || existingUsername) {
-                return sendResponse(res, 400, false, 'Username hoặc Email đã được sử dụng trong hệ thống');
+            if (existingAccount) {
+                return sendResponse(res, 400, false, 'Email đã được sử dụng trong hệ thống');
             }
 
             // Băm mật khẩu
@@ -44,7 +43,7 @@ const AccountController = {
 
             // Lưu vào DB
             const newAccountId = await AccountModel.create({
-                username, password_hash, full_name, email, phone, role_id
+                password_hash, full_name, email, phone, role_id, branch_id
             });
 
             // Ghi log hoạt động
@@ -53,7 +52,7 @@ const AccountController = {
                 action: 'CREATE_ACCOUNT',
                 target_table: 'accounts',
                 target_id: newAccountId,
-                description: `Tạo tài khoản mới: ${username}`,
+                description: `Tạo tài khoản mới: ${email}`,
                 ip_address: req.ip || req.connection?.remoteAddress
             }).catch(console.error);
 
@@ -63,14 +62,14 @@ const AccountController = {
         }
     },
 
-    // 3. Cập nhật thông tin (Chỉ Admin)
+    // 3. Cập nhật tài khoản
     updateAccount: async (req, res, next) => {
         try {
             const { id } = req.params;
-            const { full_name, phone, role_id } = req.body;
+            const { full_name, phone, role_id, branch_id } = req.body;
 
             if (!full_name || !role_id) {
-                return sendResponse(res, 400, false, 'Họ tên và Vai trò (Role) không được để trống');
+                return sendResponse(res, 400, false, 'Họ tên và vai trò là bắt buộc');
             }
 
             // Không cho phép sửa thông tin của tài khoản "admin" gốc (hardcoded bảo vệ)
@@ -78,7 +77,7 @@ const AccountController = {
                 return sendResponse(res, 403, false, 'Không thể chỉnh sửa tài khoản Admin hệ thống');
             }
 
-            await AccountModel.update(id, { full_name, phone, role_id });
+            await AccountModel.update(id, { full_name, phone, role_id, branch_id });
 
             AccountModel.logActivity({
                 account_id: req.user.id,
@@ -122,6 +121,57 @@ const AccountController = {
             }).catch(console.error);
 
             sendResponse(res, 200, true, `Đã ${is_active ? 'mở khóa' : 'khóa'} tài khoản thành công`);
+        } catch (error) {
+            next(error);
+        }
+    },
+
+    getMe: async (req, res, next) => {
+        try {
+            const pool = require('../config/database');
+            const [rows] = await pool.query(`
+                SELECT a.account_id, a.full_name, a.email, a.phone, a.is_active, a.created_at, 
+                       r.role_name as role, b.branch_name, b.branch_id
+                FROM accounts a
+                JOIN roles r ON a.role_id = r.role_id
+                LEFT JOIN branches b ON a.branch_id = b.branch_id
+                WHERE a.account_id = ?
+            `, [req.user.id]);
+            
+            if (rows.length === 0) return sendResponse(res, 404, false, 'Không tìm thấy tài khoản');
+            sendResponse(res, 200, true, 'Lấy thông tin thành công', rows[0]);
+        } catch (error) {
+            next(error);
+        }
+    },
+
+    updateMe: async (req, res, next) => {
+        try {
+            const { full_name, phone, password } = req.body;
+            const pool = require('../config/database');
+            
+            if (!full_name) {
+                return sendResponse(res, 400, false, 'Họ tên là bắt buộc');
+            }
+
+            if (password) {
+                const salt = await bcrypt.genSalt(10);
+                const password_hash = await bcrypt.hash(password, salt);
+                await pool.query('UPDATE accounts SET full_name = ?, phone = ?, password_hash = ? WHERE account_id = ?', [full_name, phone, password_hash, req.user.id]);
+            } else {
+                await pool.query('UPDATE accounts SET full_name = ?, phone = ? WHERE account_id = ?', [full_name, phone, req.user.id]);
+            }
+
+            AccountModel.logActivity({
+                account_id: req.user.id,
+                action: 'UPDATE_PROFILE',
+                target_table: 'accounts',
+                target_id: req.user.id,
+                description: `Tự cập nhật thông tin cá nhân`,
+                ip_address: req.ip || req.connection?.remoteAddress
+            }).catch(console.error);
+
+            sendResponse(res, 200, true, 'Cập nhật thông tin thành công');
         } catch (error) {
             next(error);
         }

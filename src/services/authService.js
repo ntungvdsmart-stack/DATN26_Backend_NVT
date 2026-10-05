@@ -14,11 +14,17 @@ const AuthService = {
             throw { statusCode: 400, message: 'Email đã được sử dụng' };
         }
 
+        let posCustomerId = null;
         // Kiểm tra số điện thoại (nếu có)
         if (phone) {
             const existingPhone = await CustomerModel.findByPhone(phone);
             if (existingPhone) {
-                throw { statusCode: 400, message: 'Số điện thoại đã được sử dụng' };
+                // Nếu khách có số điện thoại này nhưng chưa có password (tức là tạo từ POS)
+                if (!existingPhone.password_hash) {
+                    posCustomerId = existingPhone.customer_id;
+                } else {
+                    throw { statusCode: 400, message: 'Số điện thoại đã được sử dụng' };
+                }
             }
         }
 
@@ -26,16 +32,24 @@ const AuthService = {
         const salt = await bcrypt.genSalt(10);
         const password_hash = await bcrypt.hash(password, salt);
 
-        // Tạo người dùng mới trong CSDL
-        const customerId = await CustomerModel.create({
-            full_name,
-            phone,
-            email,
-            password_hash,
-            customer_type: 'online'
-        });
+        if (posCustomerId) {
+            // Liên kết tài khoản cho khách POS đã có
+            await CustomerModel.updateAccountForPosCustomer(posCustomerId, {
+                full_name, email, password_hash
+            });
+            return { customer_id: posCustomerId, full_name, email, phone };
+        } else {
+            // Tạo người dùng mới trong CSDL
+            const customerId = await CustomerModel.create({
+                full_name,
+                phone,
+                email,
+                password_hash,
+                customer_type: 'online'
+            });
 
-        return { customer_id: customerId, full_name, email, phone };
+            return { customer_id: customerId, full_name, email, phone };
+        }
     },
 
     // ====================================================
@@ -47,12 +61,11 @@ const AuthService = {
     login: async (identifier, password, ipAddress) => {
         let userRecord = null;
 
-        // Bước 1: Thử tìm theo email (hỗ trợ cả customer lẫn staff/admin)
+        // Thử tìm theo email (hỗ trợ cả customer lẫn staff/admin)
         userRecord = await AccountModel.findUserByEmail(identifier);
 
-        // Bước 2: Nếu không tìm thấy bằng email → thử tìm bằng username (chỉ accounts)
         if (!userRecord) {
-            userRecord = await AccountModel.findByEmailOrUsername(identifier);
+            userRecord = await AccountModel.findByEmail(identifier);
         }
 
         if (!userRecord) {
@@ -87,6 +100,7 @@ const AuthService = {
                 user: {
                     id: userRecord.id,
                     full_name: userRecord.full_name,
+                    phone: userRecord.phone,
                     email: userRecord.email,
                     role: 'customer'
                 }
@@ -115,7 +129,6 @@ const AuthService = {
             token,
             user: {
                 id: userRecord.id,
-                username: userRecord.username,
                 full_name: userRecord.full_name,
                 email: userRecord.email,
                 role_id: userRecord.role_id,

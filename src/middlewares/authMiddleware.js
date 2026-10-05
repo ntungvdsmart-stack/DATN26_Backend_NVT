@@ -30,7 +30,22 @@ const authorize = (...roles) => {
     };
 };
 
+const optionalProtect = (req, res, next) => {
+    let token;
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+        token = req.headers.authorization.split(' ')[1];
+    }
+    if (token) {
+        const decoded = verifyToken(token);
+        if (decoded) {
+            req.user = decoded;
+        }
+    }
+    next();
+};
+
 module.exports = {
     protect,
+    optionalProtect,
     authorize
 };

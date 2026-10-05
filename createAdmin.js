@@ -45,35 +45,47 @@ async function seed() {
         // ─────────────────────────────────────────
         // 3. Tạo tài khoản Admin
         // ─────────────────────────────────────────
-        await pool.query(
-            `DELETE FROM accounts WHERE username = 'admin' OR email = 'admin@gmail.com'`
-        );
+        const [adminExists] = await pool.query(`SELECT account_id FROM accounts WHERE email = 'admin@gmail.com'`);
         const adminHash = await bcrypt.hash('admin123', 10);
-        await pool.query(
-            `INSERT INTO accounts (username, password_hash, full_name, email, phone, role_id, branch_id, is_active)
-             VALUES (?, ?, ?, ?, ?, ?, NULL, 1)`,
-            ['admin', adminHash, 'System Administrator', 'admin@gmail.com', '0123456789', roleMap['Admin']]
-        );
-        console.log('✅ Admin    → username: admin       | password: admin123');
+        
+        if (adminExists.length > 0) {
+            await pool.query(
+                `UPDATE accounts SET password_hash = ?, full_name = ?, phone = ?, role_id = ?, branch_id = NULL, is_active = 1 WHERE email = 'admin@gmail.com'`,
+                [adminHash, 'System Administrator', '0123456789', roleMap['Admin']]
+            );
+        } else {
+            await pool.query(
+                `INSERT INTO accounts (password_hash, full_name, email, phone, role_id, branch_id, is_active)
+                 VALUES (?, ?, ?, ?, ?, NULL, 1)`,
+                [adminHash, 'System Administrator', 'admin@gmail.com', '0123456789', roleMap['Admin']]
+            );
+        }
+        console.log('✅ Admin    → email: admin@gmail.com       | password: admin123');
 
         // ─────────────────────────────────────────
         // 4. Tạo tài khoản Staff mẫu
         // ─────────────────────────────────────────
-        await pool.query(
-            `DELETE FROM accounts WHERE username = 'staff1'`
-        );
+        const [staffExists] = await pool.query(`SELECT account_id FROM accounts WHERE email = 'staff1@fashionos.com'`);
         const staffHash = await bcrypt.hash('123', 10);
-        await pool.query(
-            `INSERT INTO accounts (username, password_hash, full_name, email, phone, role_id, branch_id, is_active)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
-            ['staff1', staffHash, 'Nhân viên Demo', 'staff1@fashionos.com', '0987654321', roleMap['NV_Online'], 1]
-        );
-        console.log('✅ Staff    → username: staff1      | password: 123');
+        
+        if (staffExists.length > 0) {
+            await pool.query(
+                `UPDATE accounts SET password_hash = ?, full_name = ?, phone = ?, role_id = ?, branch_id = ?, is_active = 1 WHERE email = 'staff1@fashionos.com'`,
+                [staffHash, 'Nhân viên Demo', '0987654321', roleMap['NV_Online'], 1]
+            );
+        } else {
+            await pool.query(
+                `INSERT INTO accounts (password_hash, full_name, email, phone, role_id, branch_id, is_active)
+                 VALUES (?, ?, ?, ?, ?, ?, 1)`,
+                [staffHash, 'Nhân viên Demo', 'staff1@fashionos.com', '0987654321', roleMap['NV_Online'], 1]
+            );
+        }
+        console.log('✅ Staff    → email: staff1@fashionos.com      | password: 123');
 
         console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.log('🎉 Seed hoàn tất! Thông tin đăng nhập:');
-        console.log('   Admin : admin@gmail.com  hoặc  admin   / admin123');
-        console.log('   Staff : staff1@fashionos.com  hoặc  staff1  / 123');
+        console.log('   Admin : admin@gmail.com  / admin123');
+        console.log('   Staff : staff1@fashionos.com  / 123');
         console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
         process.exit(0);
