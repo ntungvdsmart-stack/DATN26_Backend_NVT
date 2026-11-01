@@ -19,10 +19,7 @@ const MaterialModel = {
         );
         return result.affectedRows;
     },
-    delete: async (id) => {
-        const [result] = await pool.query('DELETE FROM materials WHERE material_id = ?', [id]);
-        return result.affectedRows;
-    }
+    delete: async (id, accountId) => require('../services/referenceDeletionService').deleteReference('materials', id, accountId)
 };
 
 module.exports = MaterialModel;

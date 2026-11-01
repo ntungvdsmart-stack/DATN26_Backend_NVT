@@ -1,5 +1,7 @@
+const validateResourceId = require('../middlewares/validateResourceId');
 const express = require('express');
 const router = express.Router();
+router.param('id', validateResourceId);
 const AccountController = require('../controllers/accountController');
 const { protect, authorize } = require('../middlewares/authMiddleware');
 
@@ -7,8 +9,8 @@ const { protect, authorize } = require('../middlewares/authMiddleware');
 router.use(protect);
 
 // Route cho bản thân (staff/admin)
-router.get('/me', AccountController.getMe);
-router.put('/me', AccountController.updateMe);
+router.get('/me', authorize('admin', 'staff'), AccountController.getMe);
+router.put('/me', authorize('admin', 'staff'), AccountController.updateMe);
 
 // Các route quản trị cần quyền Admin
 router.use(authorize('admin'));

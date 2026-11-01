@@ -6,13 +6,13 @@ const AccountModel = {
     findUserByEmail: async (email) => {
         const [rows] = await pool.query(`
             (SELECT 
-                customer_id AS id, full_name, email, password_hash, phone,
-                NULL AS role_id, NULL AS branch_id, NULL AS is_active,
+                customer_id AS id, full_name, email, password_hash, phone, auth_version,
+                NULL AS role_id, NULL AS branch_id, is_active,
                 'customer' AS source
             FROM customers WHERE email = ? LIMIT 1)
             UNION ALL
             (SELECT 
-                account_id AS id, full_name, email, password_hash, phone,
+                account_id AS id, full_name, email, password_hash, phone, auth_version,
                 role_id, branch_id, is_active,
                 'account' AS source
             FROM accounts WHERE email = ? LIMIT 1)
@@ -23,10 +23,10 @@ const AccountModel = {
 
     findByEmail: async (email) => {
         const [rows] = await pool.query(
-            `SELECT account_id AS id, full_name, email, phone, password_hash, role_id, branch_id, is_active,
+            `SELECT account_id AS id, full_name, email, phone, password_hash, role_id, branch_id, is_active, auth_version,
              'account' AS source
-             FROM accounts WHERE email = ? LIMIT 1`,
-            [email]
+             FROM accounts WHERE email = ? OR username = ? LIMIT 1`,
+            [email, email]
         );
         return rows[0] || null;
     },
@@ -58,8 +58,8 @@ const AccountModel = {
     create: async (accountData) => {
         const { password_hash, full_name, email, phone, role_id, branch_id } = accountData;
         const [result] = await pool.query(
-            'INSERT INTO accounts (password_hash, full_name, email, phone, role_id, branch_id, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)',
-            [password_hash, full_name, email, phone, role_id, branch_id || null]
+            'INSERT INTO accounts (username, password_hash, full_name, email, phone, role_id, branch_id, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
+            [require('crypto').randomUUID(), password_hash, full_name, email, phone || null, role_id, branch_id || null]
         );
         return result.insertId;
     },
@@ -67,18 +67,20 @@ const AccountModel = {
     // Cập nhật thông tin cơ bản
     update: async (accountId, updateData) => {
         const { full_name, phone, role_id, branch_id } = updateData;
-        await pool.query(
+        const [result] = await pool.query(
             'UPDATE accounts SET full_name = ?, phone = ?, role_id = ?, branch_id = ? WHERE account_id = ?',
             [full_name, phone, role_id, branch_id || null, accountId]
         );
+        return result.affectedRows;
     },
 
     // Bật/Tắt trạng thái tài khoản (Khóa/Mở khóa)
     toggleStatus: async (accountId, status) => {
-        await pool.query(
-            'UPDATE accounts SET is_active = ? WHERE account_id = ?',
+        const [result] = await pool.query(
+            'UPDATE accounts SET is_active = ?, auth_version = auth_version + 1 WHERE account_id = ?',
             [status, accountId]
         );
+        return result.affectedRows;
     },
 
     // Đặt lại mật khẩu

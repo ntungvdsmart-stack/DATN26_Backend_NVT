@@ -1,6 +1,8 @@
 const CustomerModel = require('../models/customerModel');
 const bcrypt = require('bcryptjs');
 const { sendResponse } = require('../utils/responseHelper');
+const validPhone = value => value == null || value === '' || (typeof value === 'string' && /^(0\d{9}|\+84\d{9})$/.test(value));
+const validEmail = value => value == null || value === '' || (typeof value === 'string' && value.length <= 150 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value));
 
 const CustomerController = {
     // 1. Admin/Staff: Lấy danh sách tất cả khách hàng
@@ -33,7 +35,7 @@ const CustomerController = {
             const id = req.params.id;
             const { is_active } = req.body;
             
-            if (is_active === undefined) {
+            if (![true, false, 0, 1].includes(is_active)) {
                 return sendResponse(res, 400, false, 'Trạng thái is_active là bắt buộc');
             }
 
@@ -51,9 +53,11 @@ const CustomerController = {
     // 4. Admin/Staff: Tạo khách hàng thủ công (hoặc POS)
     createCustomerAdmin: async (req, res, next) => {
         try {
-            const { full_name, phone, email } = req.body;
+            const { full_name } = req.body;
+            const phone = typeof req.body.phone === 'string' ? req.body.phone.trim() : req.body.phone;
+            const email = typeof req.body.email === 'string' ? req.body.email.trim() : req.body.email;
 
-            if (!full_name) {
+            if (typeof full_name !== 'string' || full_name.trim().length < 2 || full_name.length > 150 || !validPhone(phone) || !validEmail(email)) {
                 return sendResponse(res, 400, false, 'Tên khách hàng là bắt buộc');
             }
             if (!phone && !email) {
@@ -76,7 +80,7 @@ const CustomerController = {
 
             // Tạo khách hàng loại 'guest' (vì tạo nhanh tại quầy hoặc admin)
             const insertId = await CustomerModel.create({
-                full_name,
+                full_name: full_name.trim(),
                 phone: phone || null,
                 email: email || `${phone || Date.now()}@noemail.local`,
                 password_hash: null, // Không cần pass
@@ -109,21 +113,22 @@ const CustomerController = {
     updateMyProfile: async (req, res, next) => {
         try {
             const customerId = req.user.id;
-            const { full_name, phone } = req.body;
+            const { full_name } = req.body;
+            const phone = typeof req.body.phone === 'string' ? req.body.phone.trim() : req.body.phone;
 
-            if (!full_name || full_name.trim().length < 2) {
+            if (typeof full_name !== 'string' || full_name.trim().length < 2 || full_name.length > 150 || !validPhone(phone)) {
                 return sendResponse(res, 400, false, 'Họ và tên phải có ít nhất 2 ký tự');
             }
 
             if (phone) {
                 const existingCustomer = await CustomerModel.findByPhone(phone);
                 // Nếu tìm thấy khách hàng khác đang dùng số này
-                if (existingCustomer && existingCustomer.customer_id !== customerId) {
+                if (existingCustomer && Number(existingCustomer.customer_id) !== Number(customerId)) {
                     return sendResponse(res, 400, false, 'Số điện thoại này đã được tài khoản khác sử dụng');
                 }
             }
 
-            await CustomerModel.updateProfile(customerId, { full_name: full_name.trim(), phone });
+            await CustomerModel.updateProfile(customerId, { full_name: full_name.trim(), phone: phone || null });
 
             // Cập nhật lại thông tin trả về cho frontend refresh
             const updated = await CustomerModel.getProfile(customerId);
@@ -142,8 +147,8 @@ const CustomerController = {
             if (!currentPassword || !newPassword) {
                 return sendResponse(res, 400, false, 'Vui lòng nhập mật khẩu hiện tại và mật khẩu mới');
             }
-            if (newPassword.length < 6) {
-                return sendResponse(res, 400, false, 'Mật khẩu mới phải có ít nhất 6 ký tự');
+            if (typeof newPassword !== 'string' || typeof currentPassword !== 'string' || newPassword.length < 8 || Buffer.byteLength(newPassword) > 72) {
+                return sendResponse(res, 400, false, 'Mật khẩu mới phải từ 8 ký tự, tối đa 72 byte');
             }
 
             const currentHash = await CustomerModel.getPasswordHash(customerId);

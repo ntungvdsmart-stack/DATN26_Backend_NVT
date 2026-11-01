@@ -29,10 +29,7 @@ const faqModel = {
     return result.affectedRows;
   },
 
-  deleteFaq: async (id) => {
-    const [result] = await db.query('DELETE FROM faqs WHERE faq_id = ?', [id]);
-    return result.affectedRows;
-  }
+  deleteFaq: async (id, accountId) => require('../services/referenceDeletionService').deleteReference('faqs', id, accountId)
 };
 
 module.exports = faqModel;

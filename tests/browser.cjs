@@ -1,0 +1,195 @@
+const { chromium } = require('../../DoAnMo/node_modules/@playwright/test');
+const { spawn } = require('node:child_process');
+const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+
+module.exports = async ({ api, fixture, admin, pos, online, warehouse }) => {
+    const frontend = path.resolve(__dirname, '../..', 'DoAnMo');
+    const origin = 'http://127.0.0.1:5190';
+    const vite = spawn(process.execPath, [path.join(frontend, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', '5190', '--strictPort'], { cwd: frontend, env: { ...process.env, VITE_API_URL: api }, windowsHide: true, stdio: ['ignore','pipe','pipe'] });
+    let browser;
+    try {
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('Browser test frontend startup timeout')), 30000);
+            vite.stdout.on('data', data => { if (data.toString().includes('5190')) { clearTimeout(timer); resolve(); } });
+            vite.once('exit', code => { clearTimeout(timer); reject(new Error(`Vite exited ${code}`)); });
+        });
+        browser = await chromium.launch({ executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true });
+        const page = await browser.newPage();
+        const errors = [];
+        page.on('pageerror', error => errors.push(error.message));
+        page.on('console', message => { if (message.type() === 'error' && /TypeError|ReferenceError|not a function|Cannot read|Invalid hook/.test(message.text())) errors.push(message.text()); });
+        page.on('response', response => { if (response.url().startsWith(api) && response.status() >= 500) errors.push(`API ${response.status()}: ${response.url()}`); });
+        await page.route(/https:\/\/(?!127\.0\.0\.1|localhost)/, route => route.abort());
+        await page.route(`${api}/vietmap/autocomplete*`, route => route.fulfill({ json: { success: true, data: [] } }));
+        const screenshots = path.join(frontend, 'test-results');
+        await fs.mkdir(screenshots, { recursive: true });
+        const noOverflow = async label => {
+            const sizes = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, width: innerWidth }));
+            assert.ok(sizes.scroll <= sizes.width + 2, `${label} overflows horizontally: ${JSON.stringify(sizes)}`);
+        };
+        await page.setViewportSize({ width: 375, height: 812 });
+        for (const route of ['/store', '/store/products', '/store/products/1', '/login']) {
+            await page.goto(origin + route);
+            await page.waitForFunction(() => document.querySelector('#root')?.textContent.trim().length > 20);
+            await noOverflow(route);
+        }
+        await page.goto(origin + '/store');
+        await page.getByRole('link', { name: 'Đơn hàng của tôi', exact: true }).first().click();
+        await page.waitForURL('**/login');
+        await page.getByPlaceholder('Email hoặc tên đăng nhập').fill('customer1@example.invalid');
+        await page.getByPlaceholder('Nhập mật khẩu', { exact: true }).fill('ChangedFixture123!');
+        await page.getByRole('button', { name: 'Đăng nhập', exact: true }).click();
+        await page.waitForURL('**/store/orders');
+        await page.getByRole('heading', { name: 'Đơn hàng của tôi', exact: true }).waitFor();
+        await page.getByRole('link', { name: 'Xem đơn hàng', exact: true }).first().waitFor();
+        for (const width of [320,375,768,1440]) {
+            await page.setViewportSize({ width, height: 900 });
+            await noOverflow(`customer orders ${width}px`);
+        }
+        await page.getByRole('textbox', { name: 'Tìm mã đơn hàng', exact: true }).fill('NONEXISTENT');
+        await page.getByText('Không có đơn hàng phù hợp.', { exact: true }).waitFor();
+        await page.getByRole('textbox', { name: 'Tìm mã đơn hàng', exact: true }).fill('');
+        await page.getByRole('link', { name: 'Xem đơn hàng', exact: true }).first().click();
+        await page.waitForURL('**/store/tracking?code=*');
+        await page.getByRole('button', { name: 'Tra cứu', exact: true }).waitFor();
+        await noOverflow('customer order detail');
+        await page.screenshot({ path: path.join(screenshots, 'customer-orders-desktop.png'), fullPage: true });
+        await page.setViewportSize({ width: 375, height: 812 });
+        await page.goto(origin + '/store/profile');
+        await page.getByRole('button', { name: 'Sổ địa chỉ', exact: true }).click();
+        await page.getByRole('button', { name: 'Sửa địa chỉ', exact: true }).first().click();
+        await page.getByRole('textbox', { name: 'Tên người nhận', exact: true }).fill('Updated browser recipient');
+        await noOverflow('mobile address editing');
+        await page.getByRole('button', { name: 'Lưu địa chỉ', exact: true }).click();
+        await page.getByText('Updated browser recipient', { exact: true }).waitFor();
+        await page.screenshot({ path: path.join(screenshots, 'customer-address-mobile.png'), fullPage: true });
+        await page.goto(origin + '/store/products/1');
+        await page.getByRole('heading', { name: 'Đánh giá của bạn', exact: true }).waitFor();
+        await page.getByRole('button', { name: 'Sửa', exact: true }).click();
+        await page.getByRole('textbox', { name: 'Nhận xét', exact: true }).fill('Browser updated review');
+        await page.locator('button[aria-label="4 sao"]:enabled').click();
+        await page.getByRole('button', { name: 'Lưu đánh giá', exact: true }).click();
+        await page.getByText('Browser updated review', { exact: true }).waitFor();
+        page.once('dialog', dialog => dialog.accept());
+        await page.getByRole('button', { name: 'Xóa', exact: true }).click();
+        await page.getByRole('button', { name: 'Viết đánh giá', exact: true }).click();
+        await page.locator('select').last().selectOption('1');
+        await page.locator('button[aria-label="5 sao"]:enabled').click();
+        await page.getByRole('textbox', { name: 'Nhận xét', exact: true }).fill('Browser recreated review');
+        for (const width of [320, 375, 768, 1440]) {
+            await page.setViewportSize({ width, height: 900 });
+            await noOverflow(`review form ${width}px`);
+        }
+        await page.getByRole('button', { name: 'Gửi đánh giá', exact: true }).click();
+        await page.getByText('Browser recreated review', { exact: true }).waitFor();
+        console.log('PASS browser: review edit/delete/create and responsive form');
+        await page.evaluate(() => { localStorage.removeItem('token'); localStorage.removeItem('user'); });
+        await page.setViewportSize({ width: 375, height: 812 });
+        await page.goto(origin + '/login');
+        console.log('PASS browser: prominent customer orders, login return, search, detail and 320/375/768/1440px layouts');
+        await page.getByPlaceholder('Email hoặc tên đăng nhập').fill('fixture3');
+        await page.getByPlaceholder('Nhập mật khẩu', { exact: true }).fill(fixture.password);
+        await page.getByRole('button', { name: 'Đăng nhập', exact: true }).click();
+        await page.waitForURL('**/pos');
+        await page.waitForFunction(() => document.querySelector('#root')?.textContent.trim().length > 20);
+        await page.getByText('Fixture shirt', { exact: true }).first().click();
+        await page.getByText('FIXTURE-S', { exact: true }).click();
+        await page.getByRole('button', { name: 'THANH TOÁN (F9)', exact: true }).waitFor();
+        await noOverflow('mobile POS');
+        await page.screenshot({ path: path.join(screenshots, 'pos-mobile.png'), fullPage: true });
+        console.log('PASS browser: mobile storefront, username login and POS layout');
+
+        const useSession = async session => {
+            await page.evaluate(data => { localStorage.setItem('token', data.token); localStorage.setItem('user', JSON.stringify(data.user)); }, session);
+        };
+        await useSession(admin);
+        await require('./forms.cjs')({ page, origin, api, screenshots });
+        for (const route of ['/dashboard','/products','/inventory','/orders','/returns','/online','/payments','/support','/customers','/admin','/admin/accounts','/admin/branches','/admin/categories','/admin/promotions','/admin/faqs','/admin/logs','/admin/roles','/reports','/profile']) {
+            await page.goto(origin + route);
+            await page.waitForFunction(() => document.querySelector('#root')?.textContent.trim().length > 20);
+            await noOverflow(`mobile ${route}`);
+            assert.equal(await page.getByText('Đã xảy ra lỗi').count(), 0, `${route} rendered error boundary`);
+        }
+        await page.goto(origin + '/inventory');
+        await page.waitForFunction(() => document.querySelector('#root')?.textContent.trim().length > 20);
+        await page.getByRole('button', { name: 'Mở menu', exact: true }).click();
+        await page.getByRole('link', { name: 'Phân quyền vai trò', exact: true }).click();
+        await page.waitForURL('**/admin/roles');
+        await page.waitForFunction(() => document.querySelector('#root')?.textContent.trim().length > 20);
+        await page.screenshot({ path: path.join(screenshots, 'permissions-mobile.png'), fullPage: true });
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await page.goto(origin + '/admin/roles');
+        await page.waitForFunction(() => document.querySelector('#root')?.textContent.trim().length > 20);
+        await noOverflow('desktop permissions');
+        await page.screenshot({ path: path.join(screenshots, 'permissions-desktop.png'), fullPage: true });
+        console.log('PASS browser: admin routes, mobile menu and permission management layouts');
+        await page.goto(origin + '/products');
+        const historicalRow = page.getByRole('row').filter({ has: page.getByText('Fixture shirt', { exact: true }) });
+        page.once('dialog', dialog => dialog.accept());
+        await historicalRow.getByTitle('Xóa vĩnh viễn', { exact: true }).click();
+        const deactivate = page.locator('[data-sonner-toast]').getByRole('button', { name: 'Ngừng bán', exact: true });
+        await deactivate.waitFor();
+        page.once('dialog', dialog => dialog.accept());
+        await Promise.all([page.waitForResponse(response => response.url() === `${api}/products/1/status` && response.request().method() === 'PATCH'), deactivate.click()]);
+        const [[preserved]] = await fixture.db.query('SELECT is_active FROM products WHERE product_id=1');
+        assert.equal(preserved.is_active, 0);
+        await page.evaluate(async ({ api, token }) => {
+            const response = await fetch(`${api}/products/1/status`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ is_active: true }) });
+            if (!response.ok) throw new Error('Fixture product restore failed');
+        }, { api, token: admin.token });
+        console.log('PASS browser: product FK conflict offers deactivate action and preserves the product');
+        await page.goto(origin + '/online');
+        await page.getByRole('button', { name: 'Chi tiết', exact: true }).first().click();
+        await page.getByRole('dialog', { name: 'Chi tiết đơn online' }).waitFor();
+        await page.getByRole('button', { name: 'Đóng chi tiết', exact: true }).click();
+        await useSession(online);
+        await page.goto(origin + '/products');
+        await page.getByTitle('Xem chi tiết', { exact: true }).first().click();
+        await page.locator('fieldset[disabled]').waitFor();
+        assert.equal(await page.getByRole('button', { name: 'Lưu thay đổi', exact: true }).count(), 0);
+        await page.goto(origin + '/inventory');
+        await page.locator('select[disabled]').waitFor();
+        await page.locator('select[disabled] option').waitFor({ state: 'attached' });
+        const branchOptions = await page.locator('select[disabled] option').count();
+        assert.equal(branchOptions, 1);
+        await page.getByText('Fixture shirt', { exact: true }).first().click();
+        const [[beforeReceipt]] = await fixture.db.query('SELECT SUM(quantity) AS total FROM inventory WHERE branch_id=1');
+        await page.getByRole('button', { name: 'Nhập hàng', exact: true }).first().click();
+        await page.locator('input[type="number"]').fill('3');
+        await page.locator('textarea').fill('Browser receipt');
+        await page.getByRole('button', { name: 'Lưu', exact: true }).click();
+        await page.getByRole('heading', { name: 'Nhập hàng vào chi nhánh', exact: true }).waitFor({ state: 'hidden' });
+        const [[afterReceipt]] = await fixture.db.query('SELECT SUM(quantity) AS total FROM inventory WHERE branch_id=1');
+        assert.equal(Number(afterReceipt.total), Number(beforeReceipt.total) + 3);
+        await page.goto(origin + '/pos');
+        await page.waitForURL('**/pos');
+        await useSession(admin);
+        await page.goto(origin + '/pos');
+        await page.waitForURL('**/dashboard');
+        const [pending] = await fixture.db.query("INSERT INTO orders (order_code,channel,customer_id,order_status,subtotal_amount,total_amount,shipping_address_snapshot,shipping_latitude,shipping_longitude) VALUES ('BROWSER-ASSIGN','online',1,'pending',100000,100000,'Fixture address',10,106)");
+        await fixture.db.query('INSERT INTO order_items (order_id,variant_id,quantity,unit_price) VALUES (?,1,1,100000)', [pending.insertId]);
+        await page.goto(origin + '/orders?search=BROWSER-ASSIGN');
+        await page.getByTitle('Phân công chi nhánh', { exact: true }).click();
+        const assignment = page.getByRole('dialog', { name: 'Phân công đơn hàng', exact: true });
+        await assignment.getByRole('button').filter({ hasText: 'Test branch 1' }).click();
+        await assignment.getByRole('button', { name: 'Tiếp tục', exact: true }).click();
+        await assignment.locator('select').selectOption('2');
+        await assignment.getByRole('button', { name: 'Gửi yêu cầu', exact: true }).click();
+        await assignment.waitFor({ state: 'hidden' });
+        const [[assigned]] = await fixture.db.query('SELECT branch_id, staff_id FROM orders WHERE order_id=?', [pending.insertId]);
+        assert.equal(assigned.branch_id, 1);
+        assert.equal(assigned.staff_id, 2);
+        console.log('PASS browser: staff receives own-branch stock; admin selects branch then staff to allocate an order');
+        await useSession(warehouse);
+        await page.goto(origin + '/pos');
+        await page.waitForURL('**/pos');
+        assert.deepEqual(errors, [], 'Browser runtime/API failures');
+        console.log('PASS browser: staff permissions hide denied links and reject unauthorized pages');
+    } finally {
+        if (browser) await browser.close();
+        vite.kill();
+        await new Promise(resolve => vite.once('exit', resolve));
+    }
+};

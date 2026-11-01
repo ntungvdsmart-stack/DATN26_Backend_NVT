@@ -19,10 +19,7 @@ const SizeModel = {
         );
         return result.affectedRows;
     },
-    delete: async (id) => {
-        const [result] = await pool.query('DELETE FROM sizes WHERE size_id = ?', [id]);
-        return result.affectedRows;
-    }
+    delete: async (id, accountId) => require('../services/referenceDeletionService').deleteReference('sizes', id, accountId)
 };
 
 module.exports = SizeModel;

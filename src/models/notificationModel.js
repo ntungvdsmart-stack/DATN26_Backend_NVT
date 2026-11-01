@@ -18,11 +18,11 @@ const notificationModel = {
     let params = [];
 
     if (role === 'customer') {
-      query = 'SELECT * FROM notifications WHERE customer_id = ? ORDER BY created_at DESC LIMIT 50';
+      query = 'SELECT n.*, o.order_code FROM notifications n LEFT JOIN orders o ON o.order_id=n.related_order_id WHERE n.customer_id = ? ORDER BY n.created_at DESC,n.notification_id DESC LIMIT 50';
       params = [userId];
     } else {
       // For admin/staff, we get notifications targeted to their account, or generic system notifications (where account_id IS NULL and customer_id IS NULL)
-      query = 'SELECT * FROM notifications WHERE account_id = ? OR (account_id IS NULL AND customer_id IS NULL) ORDER BY created_at DESC LIMIT 50';
+      query = 'SELECT n.*, o.order_code FROM notifications n LEFT JOIN orders o ON o.order_id=n.related_order_id WHERE n.account_id = ? ORDER BY n.created_at DESC,n.notification_id DESC LIMIT 50';
       params = [userId];
     }
 
@@ -31,16 +31,21 @@ const notificationModel = {
   },
 
   // Mark a single notification as read
-  markAsRead: async (notificationId) => {
-    const [result] = await db.query(
-      'UPDATE notifications SET is_read = 1 WHERE notification_id = ?',
-      [notificationId]
-    );
-    return result.affectedRows;
+  countUnread: async (userId, role) => {
+    const column = role === 'customer' ? 'customer_id' : 'account_id';
+    const [[row]] = await db.query(`SELECT COUNT(*) AS count FROM notifications WHERE ${column} = ? AND is_read = 0`, [userId]);
+    return Number(row.count);
+  },
+  markAsRead: async (notificationId, userId, role) => {
+    const column = role === 'customer' ? 'customer_id' : 'account_id';
+    const [[owned]] = await db.query(`SELECT notification_id FROM notifications WHERE notification_id = ? AND ${column} = ?`, [notificationId, userId]);
+    if (!owned) return false;
+    await db.query(`UPDATE notifications SET is_read = 1 WHERE notification_id = ? AND ${column} = ?`, [notificationId, userId]);
+    return true;
   },
 
   // Mark all notifications as read for a specific user
-  markAllAsRead: async (userId, role) => {
+  markAllAsRead: async (userId, role, beforeId = null) => {
     let query = '';
     let params = [];
 
@@ -48,10 +53,11 @@ const notificationModel = {
       query = 'UPDATE notifications SET is_read = 1 WHERE customer_id = ? AND is_read = 0';
       params = [userId];
     } else {
-      query = 'UPDATE notifications SET is_read = 1 WHERE (account_id = ? OR (account_id IS NULL AND customer_id IS NULL)) AND is_read = 0';
+      query = 'UPDATE notifications SET is_read = 1 WHERE account_id = ? AND is_read = 0';
       params = [userId];
     }
 
+    if (beforeId != null) { query += ' AND notification_id <= ?'; params.push(beforeId); }
     const [result] = await db.query(query, params);
     return result.affectedRows;
   }

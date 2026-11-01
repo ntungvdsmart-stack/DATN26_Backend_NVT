@@ -21,7 +21,7 @@ const AuthService = {
             if (existingPhone) {
                 // Nếu khách có số điện thoại này nhưng chưa có password (tức là tạo từ POS)
                 if (!existingPhone.password_hash) {
-                    posCustomerId = existingPhone.customer_id;
+                    throw { statusCode: 409, message: 'Số điện thoại đã có hồ sơ tại cửa hàng. Vui lòng liên hệ nhân viên để xác minh và liên kết tài khoản.' };
                 } else {
                     throw { statusCode: 400, message: 'Số điện thoại đã được sử dụng' };
                 }
@@ -73,7 +73,7 @@ const AuthService = {
         }
 
         // Kiểm tra tài khoản bị khóa (chỉ áp dụng cho staff/admin)
-        if (userRecord.source === 'account' && !userRecord.is_active) {
+        if (!userRecord.is_active) {
             throw { statusCode: 403, message: 'Tài khoản đã bị khóa. Vui lòng liên hệ quản trị viên.' };
         }
 
@@ -92,6 +92,7 @@ const AuthService = {
         if (userRecord.source === 'customer') {
             const token = generateToken({
                 id: userRecord.id,
+                auth_version: userRecord.auth_version,
                 role: 'customer'
             });
 
@@ -109,9 +110,11 @@ const AuthService = {
 
         // Staff / Admin — phân role dựa trên role_id
         const roleName = userRecord.role_id === 1 ? 'admin' : 'staff';
+        const permissions = await require('./roleService').getPermissions(userRecord.role_id);
 
         const token = generateToken({
             id: userRecord.id,
+            auth_version: userRecord.auth_version,
             role_id: userRecord.role_id,
             branch_id: userRecord.branch_id,
             role: roleName
@@ -133,6 +136,7 @@ const AuthService = {
                 email: userRecord.email,
                 role_id: userRecord.role_id,
                 branch_id: userRecord.branch_id,
+                permissions,
                 role: roleName
             }
         };

@@ -13,10 +13,7 @@ const BrandModel = {
         const [result] = await pool.query('UPDATE brands SET brand_name = ? WHERE brand_id = ?', [brand_name, id]);
         return result.affectedRows;
     },
-    delete: async (id) => {
-        const [result] = await pool.query('DELETE FROM brands WHERE brand_id = ?', [id]);
-        return result.affectedRows;
-    }
+    delete: async (id, accountId) => require('../services/referenceDeletionService').deleteReference('brands', id, accountId)
 };
 
 module.exports = BrandModel;

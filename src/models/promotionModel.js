@@ -44,10 +44,7 @@ const promotionModel = {
     return result.affectedRows;
   },
 
-  delete: async (id) => {
-    const [result] = await db.query('DELETE FROM promotions WHERE promotion_id = ?', [id]);
-    return result.affectedRows;
-  },
+  delete: async (id, accountId) => require('../services/referenceDeletionService').deleteReference('promotions', id, accountId),
 
   getUsageCount: async (promotionId, customerId = null) => {
     // Total usage overall

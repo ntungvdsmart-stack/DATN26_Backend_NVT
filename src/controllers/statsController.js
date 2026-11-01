@@ -1,17 +1,20 @@
 const pool = require('../config/database');
+const NET_REVENUE = `GREATEST(0, o.total_amount - COALESCE((SELECT SUM(r.amount) FROM payment_refunds r JOIN payments rp ON rp.payment_id = r.payment_id WHERE rp.order_id = o.order_id AND r.status = 'completed'), 0))`;
+const NET_QUANTITY = `GREATEST(0, oi.quantity - COALESCE((SELECT SUM(ri.quantity) FROM order_return_items ri JOIN order_returns ret ON ret.return_id = ri.return_id WHERE ri.order_item_id = oi.order_item_id AND ret.status = 'completed' AND ret.return_type = 'return'),0))`;
+const NET_LINE_REVENUE = `(${NET_QUANTITY}) * oi.unit_price * GREATEST(0, o.subtotal_amount - o.discount_amount - COALESCE(o.loyalty_discount,0)) / NULLIF(o.subtotal_amount,0)`;
 
 const StatsController = {
   getKPIs: async (req, res) => {
     try {
       const [revResult] = await pool.query(`
-        SELECT SUM(total_amount) as totalRevenue 
-        FROM orders 
-        WHERE order_status IN ('completed', 'shipping')
+        SELECT SUM(${NET_REVENUE}) as totalRevenue 
+        FROM orders o 
+        WHERE order_status IN ('completed', 'shipping', 'returned')
       `);
       
       const [orderResult] = await pool.query(`
         SELECT COUNT(*) as totalOrders 
-        FROM orders
+        FROM orders o
       `);
 
       const [customerResult] = await pool.query(`
@@ -28,10 +31,10 @@ const StatsController = {
       res.status(200).json({
         success: true,
         data: {
-          revenue: revResult[0].totalRevenue || 0,
-          orders: orderResult[0].totalOrders || 0,
-          customers: customerResult[0].totalCustomers || 0,
-          returnRate: returnResult[0].returnRate || 0
+          revenue: Number(revResult[0].totalRevenue) || 0,
+          orders: Number(orderResult[0].totalOrders) || 0,
+          customers: Number(customerResult[0].totalCustomers) || 0,
+          returnRate: Number(returnResult[0].returnRate) || 0
         }
       });
     } catch (error) {
@@ -48,9 +51,9 @@ const StatsController = {
       if (mode === 'week') {
         // Lấy 7 ngày gần nhất
         const [rows] = await pool.query(`
-          SELECT DATE(created_at) as date, SUM(total_amount) as revenue, COUNT(order_id) as orders
-          FROM orders
-          WHERE order_status IN ('completed', 'shipping') 
+          SELECT DATE(created_at) as date, SUM(${NET_REVENUE}) as revenue, COUNT(order_id) as orders
+          FROM orders o
+          WHERE order_status IN ('completed', 'shipping', 'returned') 
             AND created_at >= DATE(NOW()) - INTERVAL 6 DAY
           GROUP BY DATE(created_at)
           ORDER BY date ASC
@@ -81,9 +84,9 @@ const StatsController = {
       } else {
         // Lấy 12 tháng gần nhất
         const [rows] = await pool.query(`
-          SELECT DATE_FORMAT(created_at, '%Y-%m') as month, SUM(total_amount) as revenue, COUNT(order_id) as orders
-          FROM orders
-          WHERE order_status IN ('completed', 'shipping')
+          SELECT DATE_FORMAT(created_at, '%Y-%m') as month, SUM(${NET_REVENUE}) as revenue, COUNT(order_id) as orders
+          FROM orders o
+          WHERE order_status IN ('completed', 'shipping', 'returned')
             AND created_at >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
           GROUP BY month
           ORDER BY month ASC
@@ -91,6 +94,7 @@ const StatsController = {
         // Fill missing months
         const last12Months = Array.from({length: 12}, (_, i) => {
           const d = new Date();
+          d.setDate(1);
           d.setMonth(d.getMonth() - (11 - i));
           return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
         });
@@ -115,23 +119,24 @@ const StatsController = {
 
   getTopProducts: async (req, res) => {
     try {
+      const channel = ['online','pos'].includes(req.query.channel) ? req.query.channel : null;
       const [rows] = await pool.query(`
         SELECT 
           p.product_id as id,
           p.product_name as name,
-          MIN(pi.image_url) as image,
-          SUM(oi.quantity) as sold,
-          SUM(oi.quantity * oi.unit_price) as revenue
+          (SELECT pi.image_url FROM product_images pi WHERE pi.product_id = p.product_id ORDER BY pi.is_primary DESC, pi.image_id LIMIT 1) as image,
+          SUM(${NET_QUANTITY}) as sold,
+          SUM(${NET_LINE_REVENUE}) as revenue
         FROM order_items oi
         JOIN product_variants pv ON oi.variant_id = pv.variant_id
         JOIN products p ON pv.product_id = p.product_id
         JOIN orders o ON oi.order_id = o.order_id
-        LEFT JOIN product_images pi ON p.product_id = pi.product_id AND pi.is_primary = 1
-        WHERE o.order_status IN ('completed', 'shipping', 'processing')
+        WHERE o.order_status IN ('completed', 'shipping', 'returned')
+          AND (? IS NULL OR o.channel = ?)
         GROUP BY p.product_id
         ORDER BY sold DESC
         LIMIT 5
-      `);
+      `, [channel, channel]);
 
       res.status(200).json({ success: true, data: rows });
     } catch (error) {
@@ -145,13 +150,13 @@ const StatsController = {
       const [rows] = await pool.query(`
         SELECT 
           c.category_name as name,
-          SUM(oi.quantity * oi.unit_price) as revenue
+          SUM(${NET_LINE_REVENUE}) as revenue
         FROM order_items oi
         JOIN product_variants pv ON oi.variant_id = pv.variant_id
         JOIN products p ON pv.product_id = p.product_id
         JOIN categories c ON p.category_id = c.category_id
         JOIN orders o ON oi.order_id = o.order_id
-        WHERE o.order_status IN ('completed', 'shipping')
+        WHERE o.order_status IN ('completed', 'shipping', 'returned')
         GROUP BY c.category_id
         ORDER BY revenue DESC
         LIMIT 6
@@ -202,9 +207,9 @@ const StatsController = {
         SELECT 
           channel as name,
           COUNT(order_id) as orders,
-          SUM(total_amount) as revenue
-        FROM orders
-        WHERE order_status IN ('completed', 'shipping')
+          SUM(${NET_REVENUE}) as revenue
+        FROM orders o
+        WHERE order_status IN ('completed', 'shipping', 'returned')
         GROUP BY channel
       `);
       
@@ -233,15 +238,15 @@ const StatsController = {
       const [rows] = await pool.query(`
         SELECT 
           COUNT(DISTINCT o.order_id) as totalOrders,
-          SUM(CASE WHEN p.payment_method = 'cash' THEN p.amount ELSE 0 END) as totalCash,
-          SUM(CASE WHEN p.payment_method != 'cash' THEN p.amount ELSE 0 END) as totalTransfer
+          SUM(CASE WHEN p.payment_method = 'cash' THEN GREATEST(0, p.amount - COALESCE((SELECT SUM(r.amount) FROM payment_refunds r WHERE r.payment_id = p.payment_id AND r.status = 'completed'),0)) ELSE 0 END) as totalCash,
+          SUM(CASE WHEN p.payment_method != 'cash' THEN GREATEST(0, p.amount - COALESCE((SELECT SUM(r.amount) FROM payment_refunds r WHERE r.payment_id = p.payment_id AND r.status = 'completed'),0)) ELSE 0 END) as totalTransfer
         FROM orders o
         JOIN payments p ON o.order_id = p.order_id
         WHERE o.staff_id = ? 
           AND o.channel = 'pos'
           AND DATE(o.created_at) = CURDATE()
           AND o.order_status != 'cancelled'
-          AND p.payment_status = 'success'
+          AND p.payment_status IN ('success','refunded')
       `, [staffId]);
 
       res.status(200).json({

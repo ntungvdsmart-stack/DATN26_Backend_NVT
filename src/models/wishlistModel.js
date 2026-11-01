@@ -1,6 +1,22 @@
 const db = require('../config/database');
 
 const wishlistModel = {
+  toggleVariant: async (customerId, variantId) => {
+    const connection = await db.getConnection();
+    try {
+      await connection.beginTransaction();
+      await connection.query('SELECT customer_id FROM customers WHERE customer_id = ? FOR UPDATE', [customerId]);
+      const [[existing]] = await connection.query('SELECT wishlist_id FROM wishlists WHERE customer_id = ? AND variant_id = ?', [customerId, variantId]);
+      if (existing) await connection.query('DELETE FROM wishlists WHERE wishlist_id = ?', [existing.wishlist_id]);
+      else {
+        const [[variant]] = await connection.query('SELECT variant_id FROM product_variants WHERE variant_id = ? AND is_active = 1', [variantId]);
+        if (!variant) throw Object.assign(new Error('Biến thể không tồn tại hoặc đã ngừng bán'), { statusCode: 404 });
+        await connection.query('INSERT INTO wishlists (customer_id, variant_id) VALUES (?, ?)', [customerId, variantId]);
+      }
+      await connection.commit();
+      return existing ? 'removed' : 'added';
+    } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+  },
   getWishlist: async (customerId) => {
     const [rows] = await db.query(`
       SELECT 

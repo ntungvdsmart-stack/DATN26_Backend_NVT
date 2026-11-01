@@ -100,7 +100,7 @@ const CustomerModel = {
     // Khóa / Mở khóa tài khoản
     updateCustomerStatus: async (id, isActive) => {
         const [result] = await pool.query(
-            'UPDATE customers SET is_active = ? WHERE customer_id = ?',
+            'UPDATE customers SET is_active = ?, auth_version = auth_version + 1 WHERE customer_id = ?',
             [isActive ? 1 : 0, id]
         );
         return result.affectedRows > 0;
@@ -146,7 +146,7 @@ const CustomerModel = {
     // Đổi mật khẩu
     updatePassword: async (customerId, newPasswordHash) => {
         const [result] = await pool.query(
-            'UPDATE customers SET password_hash = ? WHERE customer_id = ?',
+            'UPDATE customers SET password_hash = ?, auth_version = auth_version + 1 WHERE customer_id = ?',
             [newPasswordHash, customerId]
         );
         return result.affectedRows > 0;

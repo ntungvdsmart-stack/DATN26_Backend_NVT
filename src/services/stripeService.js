@@ -41,11 +41,11 @@ const StripeService = {
         try { await stripe.checkout.sessions.expire(sessionId); } catch (_) { /* đã hết hạn / đã trả */ }
     },
 
-    refund: async (paymentIntentId, amount) => {
+    refund: async (paymentIntentId, amount, idempotencyKey) => {
         return stripe.refunds.create({
             payment_intent: paymentIntentId,
             ...(amount ? { amount: Math.round(Number(amount)) } : {})
-        });
+        }, idempotencyKey ? { idempotencyKey } : undefined);
     },
 
     constructWebhookEvent: (rawBody, signature) =>

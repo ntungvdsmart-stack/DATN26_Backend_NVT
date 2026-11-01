@@ -1,4 +1,5 @@
 const pool = require('../config/database');
+const { assertNoHistory, clearShoppingReferences } = require('../services/productDeletionService');
 
 const ProductModel = {
     // 1. Lấy danh sách sản phẩm (kèm số lượng biến thể và tổng tồn kho)
@@ -22,7 +23,7 @@ const ProductModel = {
     },
 
     // 2. Lấy chi tiết 1 sản phẩm (kèm variants + images)
-    getById: async (productId) => {
+    getById: async (productId, branchId = null) => {
         const [products] = await pool.query(`
             SELECT p.*, c.category_name, b.brand_name 
             FROM products p
@@ -44,10 +45,10 @@ const ProductModel = {
             LEFT JOIN sizes s ON v.size_id = s.size_id
             LEFT JOIN colors c ON v.color_id = c.color_id
             LEFT JOIN materials m ON v.material_id = m.material_id
-            LEFT JOIN inventory i ON v.variant_id = i.variant_id
+            LEFT JOIN inventory i ON v.variant_id = i.variant_id AND (? IS NULL OR i.branch_id = ?)
             WHERE v.product_id = ?
             GROUP BY v.variant_id
-        `, [productId]);
+        `, [branchId, branchId, productId]);
 
         const [images] = await pool.query(`
             SELECT image_id, variant_id, image_url, is_primary, sort_order
@@ -64,12 +65,28 @@ const ProductModel = {
     getPublicProducts: async () => {
         const [rows] = await pool.query(`
             SELECT 
-                p.product_id, p.product_name, p.base_price, p.created_at,
-                c.category_name, b.brand_name,
+                p.product_id, p.product_name, p.base_price, p.created_at, p.category_id, p.brand_id,
+                (SELECT variant_id FROM product_variants pv WHERE pv.product_id = p.product_id AND pv.is_active = 1 ORDER BY pv.variant_id LIMIT 1) AS variant_id,
+                c.category_name, pc.category_name AS parent_category_name, b.brand_name,
+                COALESCE(sales.sold_count, 0) AS sold_count,
                 (SELECT image_url FROM product_images pi WHERE pi.product_id = p.product_id AND pi.is_primary = 1 LIMIT 1) as primary_image
             FROM products p
             LEFT JOIN categories c ON p.category_id = c.category_id
+            LEFT JOIN categories pc ON pc.category_id = c.parent_id
             LEFT JOIN brands b ON p.brand_id = b.brand_id
+            LEFT JOIN (
+                SELECT v.product_id, SUM(GREATEST(0, oi.quantity - COALESCE(ret.quantity, 0))) AS sold_count
+                FROM order_items oi
+                JOIN orders o ON o.order_id = oi.order_id AND o.order_status IN ('completed', 'returned')
+                JOIN product_variants v ON v.variant_id = oi.variant_id
+                LEFT JOIN (
+                    SELECT ri.order_item_id, SUM(ri.quantity) AS quantity
+                    FROM order_return_items ri JOIN order_returns r ON r.return_id = ri.return_id
+                    WHERE r.status = 'completed' AND r.return_type = 'return'
+                    GROUP BY ri.order_item_id
+                ) ret ON ret.order_item_id = oi.order_item_id
+                GROUP BY v.product_id
+            ) sales ON sales.product_id = p.product_id
             WHERE p.is_active = 1
             ORDER BY p.created_at DESC
         `);
@@ -129,14 +146,13 @@ const ProductModel = {
             );
             const productId = productResult.insertId;
 
-            const targetBranchId = branchId || 1;
             for (const variant of variantsData) {
                 // Tạo SKU tự động nếu không truyền
                 const sku = variant.sku || `SKU-${productId}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
                 
                 const [variantResult] = await connection.query(
                     'INSERT INTO product_variants (product_id, sku, size_id, size_description, color_id, material_id, price) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                    [productId, sku, variant.size_id || null, variant.size_description || null, variant.color_id || null, variant.material_id || null, variant.price || base_price]
+                    [productId, sku, variant.size_id || null, variant.size_description || null, variant.color_id || null, variant.material_id || null, variant.price ?? base_price]
                 );
                 
                 const variantId = variantResult.insertId;
@@ -150,14 +166,7 @@ const ProductModel = {
                     );
                 }
 
-                // Khởi tạo tồn kho
-                const quantity = variant.quantity || 0;
-                if (quantity > 0) {
-                    await connection.query(
-                        'INSERT INTO inventory (variant_id, branch_id, quantity) VALUES (?, ?, ?)',
-                        [variantId, targetBranchId, quantity]
-                    );
-                }
+                // Nhân viên nhập hàng tại chi nhánh bằng nghiệp vụ nhập kho riêng.
             }
 
             if (imagesData && imagesData.length > 0) {
@@ -195,6 +204,14 @@ const ProductModel = {
         const connection = await pool.getConnection();
         try {
             await connection.beginTransaction();
+            const [[existingProduct]] = await connection.query('SELECT product_id FROM products WHERE product_id = ? FOR UPDATE', [productId]);
+            if (!existingProduct) throw Object.assign(new Error('Không tìm thấy sản phẩm'), { statusCode: 404 });
+            const [existingVariants] = await connection.query('SELECT variant_id FROM product_variants WHERE product_id = ? ORDER BY variant_id FOR UPDATE', [productId]);
+            if (variantsData.some(variant => variant.variant_id && !existingVariants.some(existing => Number(existing.variant_id) === Number(variant.variant_id)))) throw Object.assign(new Error('Biến thể không thuộc sản phẩm đang sửa'), { statusCode: 400 });
+            const removedIds = existingVariants.filter(existing => !variantsData.some(variant => Number(variant.variant_id) === Number(existing.variant_id))).map(row => row.variant_id);
+            await assertNoHistory(connection, removedIds);
+            await clearShoppingReferences(connection, removedIds);
+            if (removedIds.length) await connection.query('DELETE FROM product_variants WHERE product_id = ? AND variant_id IN (?)', [productId, removedIds]);
 
             // 4.1 Update thông tin cơ bản
             const { product_name, description, category_id, brand_id, base_price, is_active, size_guide_image_url } = productData;
@@ -208,7 +225,6 @@ const ProductModel = {
 
             // 4.2 Xử lý variants: upsert từng variant
             if (variantsData && variantsData.length > 0) {
-                const targetBranchId = branchId || 1;
                 for (const variant of variantsData) {
                     if (variant.variant_id) {
                         // Variant đã tồn tại → UPDATE
@@ -218,28 +234,15 @@ const ProductModel = {
                             [variant.sku, variant.size_id || null, variant.size_description || null, variant.color_id || null,
                              variant.material_id || null, variant.price, variant.variant_id, productId]
                         );
-                        // Cập nhật tồn kho
-                        await connection.query(
-                            `INSERT INTO inventory (variant_id, branch_id, quantity) VALUES (?, ?, ?)
-                             ON DUPLICATE KEY UPDATE quantity = ?`,
-                            [variant.variant_id, targetBranchId, variant.quantity ?? 0, variant.quantity ?? 0]
-                        );
                     } else {
                         // Variant mới → INSERT
                         const sku = variant.sku || `SKU-${productId}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
                         const [vRes] = await connection.query(
                             'INSERT INTO product_variants (product_id, sku, size_id, size_description, color_id, material_id, price) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                            [productId, sku, variant.size_id || null, variant.size_description || null, variant.color_id || null, variant.material_id || null, variant.price || base_price]
+                            [productId, sku, variant.size_id || null, variant.size_description || null, variant.color_id || null, variant.material_id || null, variant.price ?? base_price]
                         );
                         const newVariantId = vRes.insertId;
                         variant.variant_id = newVariantId;
-                        const quantity = variant.quantity || 0;
-                        if (quantity > 0) {
-                            await connection.query(
-                                'INSERT INTO inventory (variant_id, branch_id, quantity) VALUES (?, ?, ?)',
-                                [newVariantId, targetBranchId, quantity]
-                            );
-                        }
                     }
                 }
             }
@@ -251,6 +254,8 @@ const ProductModel = {
                     for (let i = 0; i < imagesData.length; i++) {
                         const img = imagesData[i];
                         let targetVariantId = img.variant_id || null;
+                        if (removedIds.some(id => Number(id) === Number(targetVariantId))) targetVariantId = null;
+                        if (targetVariantId && !variantsData.some(variant => Number(variant.variant_id) === Number(targetVariantId))) throw Object.assign(new Error('Ảnh không thuộc biến thể của sản phẩm đang sửa'), { statusCode: 400 });
                         if (!targetVariantId && img.color_id) {
                             const match = variantsData.find(v => String(v.color_id) === String(img.color_id));
                             if (match) targetVariantId = match.variant_id;
@@ -279,13 +284,22 @@ const ProductModel = {
         }
     },
 
-    // 5. Xóa biến thể (ON DELETE CASCADE sẽ tự xóa inventory + images gắn theo variant)
-    deleteVariant: async (variantId, productId) => {
-        const [result] = await pool.query(
-            'DELETE FROM product_variants WHERE variant_id = ? AND product_id = ?',
-            [variantId, productId]
-        );
-        return result.affectedRows > 0;
+    // 5. Xóa biến thể: giữ lịch sử giao dịch, dọn tham chiếu mua sắm trong giao dịch.
+    deleteVariant: async (variantId, productId, accountId) => {
+        const connection = await pool.getConnection();
+        try {
+            await connection.beginTransaction();
+            await connection.query('SELECT product_id FROM products WHERE product_id = ? FOR UPDATE', [productId]);
+            const [variants] = await connection.query('SELECT variant_id FROM product_variants WHERE product_id = ? ORDER BY variant_id FOR UPDATE', [productId]);
+            if (!variants.some(row => Number(row.variant_id) === Number(variantId))) { await connection.rollback(); return false; }
+            if (variants.length <= 1) throw Object.assign(new Error('Không thể xóa biến thể cuối cùng. Hãy ngừng bán hoặc xóa cả sản phẩm nếu chưa phát sinh giao dịch.'), { statusCode: 409 });
+            await assertNoHistory(connection, [Number(variantId)]);
+            await clearShoppingReferences(connection, [Number(variantId)]);
+            await connection.query('DELETE FROM product_variants WHERE variant_id = ? AND product_id = ?', [variantId, productId]);
+            if (accountId) await connection.query('INSERT INTO activity_logs (account_id, action, target_table, target_id, description) VALUES (?, ?, ?, ?, ?)', [accountId, 'DELETE_VARIANT', 'products', productId, `Xóa biến thể ${variantId}`]);
+            await connection.commit();
+            return true;
+        } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
     },
 
     // 6. Xóa hoàn toàn sản phẩm (ON DELETE CASCADE xóa variants, images, inventory)
@@ -294,10 +308,13 @@ const ProductModel = {
         try {
             await connection.beginTransaction();
             const [[p]] = await connection.query(
-                'SELECT product_name FROM products WHERE product_id = ?', [productId]
+                'SELECT product_name FROM products WHERE product_id = ? FOR UPDATE', [productId]
             );
             if (!p) throw { statusCode: 404, message: 'Không tìm thấy sản phẩm' };
-
+            const [variants] = await connection.query('SELECT variant_id FROM product_variants WHERE product_id = ? ORDER BY variant_id FOR UPDATE', [productId]);
+            const variantIds = variants.map(row => row.variant_id);
+            await assertNoHistory(connection, variantIds);
+            await clearShoppingReferences(connection, variantIds);
             await connection.query('DELETE FROM products WHERE product_id = ?', [productId]);
 
             await connection.query(
@@ -317,7 +334,8 @@ const ProductModel = {
 
     // 7. Bật/Tắt trạng thái sản phẩm
     toggleStatus: async (productId, status) => {
-        await pool.query('UPDATE products SET is_active = ? WHERE product_id = ?', [status, productId]);
+        const [result] = await pool.query('UPDATE products SET is_active = ? WHERE product_id = ?', [status, productId]);
+        return result.affectedRows;
     }
 };
 

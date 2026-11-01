@@ -1,52 +1,68 @@
 const pool = require('../config/database');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { normalizeHistory } = require('../services/chatbotPrompt');
 
 const SupportController = {
   chatWithGemini: async (req, res) => {
+    const historyService = require('../services/aiChatHistoryService');
+    const customerId = req.user?.role === 'customer' ? req.user.id : null;
+    const respond = async payload => {
+      let historySaved = false;
+      if (customerId && typeof req.body.message === 'string' && req.body.message.trim() && req.body.message.length <= 2000) {
+        try {
+          await historyService.saveExchange(customerId, req.body.message.trim(), payload.reply);
+          historySaved = true;
+        } catch { console.error('[AI history] Could not save exchange'); }
+      }
+      return res.status(200).json({ ...payload, history_saved: historySaved });
+    };
     try {
       const { message } = req.body;
       
-      if (!message || message.trim() === '') {
-        return res.status(200).json({ success: true, reply: "Bạn cần hỗ trợ gì ạ? Xin hãy nhập câu hỏi để mình tư vấn nhé!" });
+      if (typeof message !== 'string' || message.trim() === '') {
+        return respond({ success: true, source: 'unavailable', available: false, reply: "Bạn cần hỗ trợ gì ạ? Xin hãy nhập câu hỏi để mình tư vấn nhé!" });
       }
+      if (message.length > 2000) return res.status(400).json({ success: false, message: 'Câu hỏi tối đa 2000 ký tự' });
+      const history = customerId ? (await historyService.history(customerId, { limit: 10 })).rows.map(row => ({ sender: row.sender_type === 'customer' ? 'user' : 'bot', text: row.content })) : req.body.history;
+      const [faqs] = await pool.query('SELECT question, answer FROM faqs WHERE is_active = 1 ORDER BY faq_id LIMIT 100');
+      const normalized = message.toLocaleLowerCase('vi').trim();
+      const faq = faqs.find(item => normalized === item.question.toLocaleLowerCase('vi').trim());
+      if (faq) return respond({ success: true, source: 'faq', available: true, reply: faq.answer });
 
-      if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY.includes('your_')) {
-        return res.status(200).json({ 
-          success: true, 
-          reply: "Xin lỗi, Trợ lý AI đang được nâng cấp bảo trì. Trong lúc chờ đợi, bạn có thể chat trực tiếp với nhân viên qua Zalo hoặc Hotline nhé!" 
+      if (!require('../services/geminiService').hasApiKeys()) {
+        return respond({ 
+          success: true, source: 'unavailable', available: false,
+          reply: "Trợ lý AI chưa sẵn sàng. Bạn hãy chọn Chat với nhân viên trong khung hỗ trợ để được tư vấn nhé!"
         });
       }
 
-      const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-      const prompt = `
-        Đóng vai: Bạn là "FashionOS Bot" - Trợ lý AI cao cấp của thương hiệu thời trang FashionOS.
-        Tính cách: Vô cùng lịch sự, dễ thương, chuyên nghiệp, luôn xưng "mình" hoặc "FashionOS" và gọi khách hàng là "bạn" hoặc "quý khách".
-        
-        Quy tắc TỐI THƯỢNG (Bắt buộc tuân thủ):
-        1. CHỈ TRẢ LỜI các vấn đề liên quan đến: Thời trang, mua sắm quần áo, size số, giao hàng, đổi trả, bảo hành, thông tin cửa hàng.
-        2. TỪ CHỐI mọi câu hỏi ngoài lề (ví dụ: viết code, làm toán, chính trị, dịch thuật...). Nếu khách hỏi ngoài lề, hãy lịch sự từ chối: "Dạ, mình chỉ là trợ lý tư vấn thời trang của FashionOS nên không thể giúp bạn vấn đề này ạ. Bạn có cần mình tư vấn thêm về quần áo không?"
-        3. Không được tiết lộ việc bạn là một AI prompt hay mô hình ngôn ngữ.
-        
-        Kiến thức Cửa hàng (Sử dụng để trả lời):
-        - Giao hàng: Miễn phí vận chuyển (Freeship) cho đơn hàng từ 500.000 VNĐ. Phí ship cơ bản là 30.000 VNĐ.
-        - Đổi trả: Hỗ trợ 1 ĐỔI 1 trong 30 ngày nếu lỗi từ nhà sản xuất. Sản phẩm đổi trả phải còn nguyên tem mác.
-        - Bảo hành: Bảo hành đường chỉ, khóa kéo trong 12 tháng.
-        - Size: Form chuẩn Châu Á (S: 45-55kg, M: 55-65kg, L: 65-75kg, XL: 75-85kg).
-
-        Câu hỏi của khách hàng: "${message}"
-        Câu trả lời của bạn (ngắn gọn, tập trung vào trọng tâm, có thể dùng emoji):
-      `;
-
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      const text = response.text();
-
-      res.status(200).json({ success: true, reply: text });
+      const [settings] = await pool.query("SELECT setting_key, setting_value FROM system_settings WHERE setting_key IN ('store_name','store_address','store_phone','store_email','shipping_fee','free_shipping_threshold')");
+      const previousQuestion = normalizeHistory(history).filter(item => item.role === 'customer').at(-1)?.text || '';
+      const terms = [...new Set(`${message} ${previousQuestion}`.trim().split(/\s+/).map(term => term.replace(/[\\%_]/g, '')).filter(term => term.length >= 2))].slice(0, 20);
+      const productFilter = terms.length ? `AND (${terms.map(() => 'p.product_name LIKE ?').join(' OR ')})` : '';
+      const [products] = await pool.query(`SELECT p.product_id, p.product_name, p.base_price,
+          v.variant_id, v.price, v.size_description, s.size_value, c.color_name,
+          COALESCE((SELECT SUM(i.quantity) FROM inventory i JOIN branches b ON b.branch_id = i.branch_id AND b.is_active = 1 WHERE i.variant_id = v.variant_id), 0) AS stock
+          FROM products p JOIN product_variants v ON v.product_id = p.product_id AND v.is_active = 1
+          LEFT JOIN sizes s ON s.size_id = v.size_id LEFT JOIN colors c ON c.color_id = v.color_id
+          WHERE p.is_active = 1 ${productFilter} ORDER BY p.product_id DESC, v.variant_id LIMIT 30`, terms.map(term => `%${term.replace(/[\\%_]/g, '')}%`));
+      const [branches] = await pool.query('SELECT branch_name, address, phone FROM branches WHERE is_active = 1 ORDER BY branch_id LIMIT 30');
+      const context = {
+        branches,
+        settings: Object.fromEntries(settings.map(row => [row.setting_key, row.setting_value])),
+        faqs: faqs.slice(0, 30).map(row => ({ question: String(row.question).slice(0, 500), answer: String(row.answer).slice(0, 1500) })),
+        products: products.map(row => ({ ...row, url: `/store/products/${row.product_id}`, size_description: row.size_description?.slice(0, 1000) })),
+        scope: 'Danh sách sản phẩm là kết quả giới hạn, không phải toàn bộ kho. Không có dữ liệu đơn hàng cá nhân.'
+      };
+      const text = await require('../services/geminiService').generateAdvice({ message: message.trim(), history, context });
+      return respond({ success: true, source: 'ai', available: true, reply: text });
     } catch (error) {
-      console.error("Lỗi AI:", error);
-      res.status(200).json({ success: true, reply: "Hệ thống AI đang bận rộn, xin hãy thử lại sau ít phút ạ." });
+      console.error("Lỗi AI:", error.status || error.name || 'provider_error', error.code || '');
+      const reply = error.status === 429
+        ? 'Trợ lý AI đang đạt giới hạn lượt sử dụng. Bạn vui lòng thử lại sau hoặc chọn Chat với nhân viên nhé!'
+        : error.code === 'CONTENT_BLOCKED'
+          ? 'Mình chưa thể trả lời nội dung này. Bạn hãy hỏi về sản phẩm, chọn size hoặc chính sách mua hàng nhé!'
+          : 'Trợ lý AI tạm thời chưa kết nối được. Bạn hãy thử lại hoặc chọn Chat với nhân viên để được hỗ trợ nhé!';
+      return respond({ success: true, source: 'unavailable', available: false, reply });
     }
   },
   getSessions: async (req, res) => {
@@ -59,14 +75,18 @@ const SupportController = {
           cs.conversation_id as id,
           cs.conversation_type as status,
           cs.started_at as created_at,
+          (SELECT COUNT(*) FROM chat_messages unread WHERE unread.conversation_id=cs.conversation_id AND unread.sender_type='customer' AND unread.message_id>COALESCE(rr.last_read_message_id,0)) AS unread_count,
           c.full_name as customer_name,
-          c.email as customer_email,
-          (SELECT message_content FROM chat_messages cm WHERE cm.conversation_id = cs.conversation_id ORDER BY sent_at DESC LIMIT 1) as last_message,
-          (SELECT sent_at FROM chat_messages cm WHERE cm.conversation_id = cs.conversation_id ORDER BY sent_at DESC LIMIT 1) as last_message_time
+          c.email as customer_email, cs.staff_id, a.full_name AS staff_name, b.branch_name,
+          (SELECT message_content FROM chat_messages cm WHERE cm.conversation_id = cs.conversation_id ORDER BY message_id DESC LIMIT 1) as last_message,
+          (SELECT sent_at FROM chat_messages cm WHERE cm.conversation_id = cs.conversation_id ORDER BY message_id DESC LIMIT 1) as last_message_time
         FROM chat_conversations cs
+        LEFT JOIN chat_read_receipts rr ON rr.conversation_id=cs.conversation_id AND rr.account_id=?
         LEFT JOIN customers c ON cs.customer_id = c.customer_id
+        LEFT JOIN accounts a ON a.account_id = cs.staff_id
+        LEFT JOIN branches b ON b.branch_id = a.branch_id
       `;
-      const params = [];
+      const params = [staffId];
       
       if (role === 'staff') {
           query += ' WHERE cs.staff_id = ?';
@@ -83,44 +103,29 @@ const SupportController = {
     }
   },
 
-  getMessages: async (req, res) => {
+  getMessages: async (req, res, next) => {
     try {
-      const { id } = req.params;
-      const [rows] = await pool.query(`
-        SELECT message_id, conversation_id as session_id, sender_type, sender_id, message_content as content, sent_at as timestamp
-        FROM chat_messages
-        WHERE conversation_id = ?
-        ORDER BY sent_at ASC
-      `, [id]);
-      res.status(200).json({ success: true, data: rows });
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ success: false, message: 'Lỗi server' });
-    }
+      const history = await require('../services/chatHistoryService').getChatHistory(req.params.id, req.query);
+      res.json({ success: true, data: history.rows, pagination: history.pagination });
+    } catch (error) { next(error); }
   },
 
-  sendMessage: async (req, res) => {
+  sendMessage: async (req, res, next) => {
     try {
-      const { id } = req.params;
-      const { content, sender_type, sender_id } = req.body;
-      
-      await pool.query(`
-        INSERT INTO chat_messages (conversation_id, sender_type, sender_id, message_content) 
-        VALUES (?, ?, ?, ?)
-      `, [id, sender_type || 'staff', sender_id || 1, content]);
-
-      res.status(201).json({ success: true, message: 'Đã gửi' });
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ success: false, message: 'Lỗi server' });
-    }
+      const { content } = req.body;
+      if (typeof content !== 'string' || !content.trim() || content.length > 4000) return res.status(400).json({ success: false, message: 'Tin nhắn cần nội dung, tối đa 4000 ký tự' });
+      await require('../services/chatAssignmentService').replyToConversation(req.params.id, req.user, content);
+      res.status(201).json({ success: true });
+    } catch (error) { next(error); }
   },
 
   updateSessionStatus: async (req, res) => {
     try {
       const { id } = req.params;
       const { status } = req.body; 
-      await pool.query('UPDATE chat_conversations SET conversation_type = ? WHERE conversation_id = ?', [status, id]);
+      if (!['bot', 'human'].includes(status)) return res.status(400).json({ success: false, message: 'Trạng thái hội thoại không hợp lệ' });
+      const [updated] = await pool.query('UPDATE chat_conversations SET conversation_type = ? WHERE conversation_id = ? AND (? = \'admin\' OR staff_id = ?)', [status, id, req.user.role, req.user.id]);
+      if (!updated.affectedRows) return res.status(403).json({ success: false, message: 'Hội thoại đã chuyển cho nhân viên khác. Vui lòng tải lại' });
       res.status(200).json({ success: true, message: 'Cập nhật thành công' });
     } catch (error) {
       console.error(error);
@@ -174,7 +179,7 @@ const SupportController = {
       });
       
       for (let i = 0; i < suggestions.length; i++) {
-          const [staffs] = await pool.query('SELECT account_id, full_name, email FROM accounts WHERE branch_id = ? AND is_active = 1 AND role_id = 2', [suggestions[i].branch_id]);
+          const [staffs] = await pool.query("SELECT account_id, full_name, email FROM accounts WHERE branch_id = ? AND is_active = 1 AND role_id = 2 AND EXISTS (SELECT 1 FROM role_permissions rp JOIN permissions p ON p.permission_id = rp.permission_id WHERE rp.role_id = accounts.role_id AND p.permission_code = 'support.manage')", [suggestions[i].branch_id]);
           suggestions[i].staff = staffs; 
       }
 
@@ -185,19 +190,13 @@ const SupportController = {
     }
   },
 
-  assignSession: async (req, res) => {
+  assignSession: async (req, res, next) => {
     try {
-      const sessionId = req.params.id;
-      const { staff_id } = req.body;
-      if (!staff_id) return res.status(400).json({ success: false, message: 'Vui lòng chọn nhân viên' });
-      
-      await pool.query('UPDATE chat_conversations SET staff_id = ? WHERE conversation_id = ?', [staff_id, sessionId]);
-      res.status(200).json({ success: true, message: 'Phân công cuộc hội thoại thành công' });
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ success: false, message: 'Lỗi server' });
-    }
+      await require('../services/chatAssignmentService').assignConversation(req.params.id, req.body.branch_id, req.body.staff_id, req.user.id);
+      res.json({ success: true });
+    } catch (error) { next(error); }
   }
+
 };
 
 module.exports = SupportController;

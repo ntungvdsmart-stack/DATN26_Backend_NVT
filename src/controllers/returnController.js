@@ -8,22 +8,23 @@ const returnController = {
       const { order_id, return_type, reason, items } = req.body;
       // items là mảng các object: { order_item_id, quantity }
 
-      if (!order_id || !items || items.length === 0) {
+      if (!order_id || !Array.isArray(items) || items.length === 0 || items.length > 100 || typeof reason !== 'string' || !reason.trim() || reason.length > 255 || !['return', 'exchange'].includes(return_type || 'return')) {
         return res.status(400).json({ success: false, message: 'Thiếu thông tin sản phẩm cần trả' });
       }
 
-      await returnModel.createReturnRequest({ order_id, return_type, reason, items });
+      await returnModel.createReturnRequest({ order_id, return_type, reason: reason.trim(), items, actor: req.user });
       res.json({ success: true, message: 'Gửi yêu cầu đổi/trả hàng thành công' });
     } catch (error) {
       console.error('Error creating return request:', error);
-      res.status(400).json({ success: false, message: error.message || 'Lỗi khi gửi yêu cầu' });
+      if (!error.code) error.statusCode ||= 400;
+      next(error);
     }
   },
 
   // Admin lấy danh sách yêu cầu
   getAll: async (req, res, next) => {
     try {
-      const returns = await returnModel.getAllReturns();
+      const returns = await returnModel.getAllReturns(req.user.role === 'staff' ? req.user.branch_id || -1 : null);
       res.json({ success: true, data: returns });
     } catch (error) {
       console.error('Error fetching returns:', error);
@@ -42,11 +43,12 @@ const returnController = {
         return res.status(400).json({ success: false, message: 'Trạng thái không hợp lệ' });
       }
 
-      await returnModel.updateReturnStatus(id, status, accountId);
+      await returnModel.updateReturnStatus(id, status, accountId, req.body.exchanges || {}, req.user);
       res.json({ success: true, message: 'Cập nhật trạng thái thành công' });
     } catch (error) {
       console.error('Error updating return status:', error);
-      res.status(500).json({ success: false, message: error.message || 'Lỗi server' });
+      if (!error.code) error.statusCode ||= 400;
+      next(error);
     }
   }
 };

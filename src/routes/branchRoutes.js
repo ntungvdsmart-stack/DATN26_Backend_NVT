@@ -1,5 +1,7 @@
+const validateResourceId = require('../middlewares/validateResourceId');
 const express = require('express');
 const router = express.Router();
+router.param('id', validateResourceId);
 const BranchController = require('../controllers/branchController');
 const { protect, authorize } = require('../middlewares/authMiddleware');
 

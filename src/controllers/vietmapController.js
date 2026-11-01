@@ -5,13 +5,14 @@ const VietmapController = {
       const apiKey = process.env.VIETMAP_API_KEY;
 
       if (!apiKey) return res.status(500).json({ success: false, message: 'Chưa cấu hình VIETMAP_API_KEY ở backend' });
-      if (!text) return res.status(400).json({ success: false, message: 'Thiếu tham số text' });
+      if (typeof text !== 'string' || !text.trim() || text.length > 500) return res.status(400).json({ success: false, message: 'Địa chỉ cần từ 1 đến 500 ký tự' });
 
-      const response = await fetch(`https://maps.vietmap.vn/api/autocomplete/v3?apikey=${apiKey}&text=${encodeURIComponent(text)}`);
+      const response = await fetch(`https://maps.vietmap.vn/api/autocomplete/v3?apikey=${encodeURIComponent(apiKey)}&text=${encodeURIComponent(text)}`, { signal: AbortSignal.timeout(6000) });
+      if (!response.ok) return res.status(502).json({ success: false, message: 'Dịch vụ bản đồ chưa sẵn sàng' });
       const data = await response.json();
       return res.json({ success: true, data: data });
     } catch (error) {
-      return res.status(500).json({ success: false, message: 'Lỗi server khi gọi Vietmap', error: error.message });
+      return res.status(502).json({ success: false, message: 'Chưa kết nối được VietMap, vui lòng thử lại' });
     }
   },
   place: async (req, res) => {
@@ -20,13 +21,14 @@ const VietmapController = {
       const apiKey = process.env.VIETMAP_API_KEY;
 
       if (!apiKey) return res.status(500).json({ success: false, message: 'Chưa cấu hình VIETMAP_API_KEY ở backend' });
-      if (!ref_id) return res.status(400).json({ success: false, message: 'Thiếu tham số ref_id' });
+      if (typeof ref_id !== 'string' || !ref_id.trim() || ref_id.length > 500) return res.status(400).json({ success: false, message: 'Mã địa điểm không hợp lệ' });
 
-      const response = await fetch(`https://maps.vietmap.vn/api/place/v3?apikey=${apiKey}&refid=${encodeURIComponent(ref_id)}`);
+      const response = await fetch(`https://maps.vietmap.vn/api/place/v3?apikey=${encodeURIComponent(apiKey)}&refid=${encodeURIComponent(ref_id)}`, { signal: AbortSignal.timeout(6000) });
+      if (!response.ok) return res.status(502).json({ success: false, message: 'Dịch vụ bản đồ chưa sẵn sàng' });
       const data = await response.json();
       return res.json({ success: true, data: data });
     } catch (error) {
-      return res.status(500).json({ success: false, message: 'Lỗi server khi gọi Vietmap Place API', error: error.message });
+      return res.status(502).json({ success: false, message: 'Chưa lấy được vị trí VietMap, vui lòng thử lại' });
     }
   }
 };

@@ -8,10 +8,9 @@ const notificationController = {
       const userId = req.user.user_id || req.user.id;
       const role = req.user.role; // 'customer', 'admin', 'staff'
 
-      const notifications = await NotificationModel.getUserNotifications(userId, role);
+      const [notifications, unreadCount] = await Promise.all([NotificationModel.getUserNotifications(userId, role), NotificationModel.countUnread(userId, role)]);
       
       // Tính số lượng chưa đọc
-      const unreadCount = notifications.filter(n => n.is_read === 0).length;
 
       res.json({
         success: true,
@@ -28,7 +27,7 @@ const notificationController = {
   markAsRead: async (req, res, next) => {
     try {
       const { id } = req.params;
-      await NotificationModel.markAsRead(id);
+      if (!await NotificationModel.markAsRead(id, req.user.id, req.user.role)) return res.status(404).json({ success: false, message: 'Không tìm thấy thông báo của bạn' });
       res.json({ success: true, message: 'Đã đánh dấu đọc' });
     } catch (error) {
       console.error('Error marking notification as read:', error);
@@ -42,7 +41,9 @@ const notificationController = {
       const userId = req.user.user_id || req.user.id;
       const role = req.user.role;
 
-      await NotificationModel.markAllAsRead(userId, role);
+      const beforeId = req.body?.before_id;
+      if (beforeId != null && (!/^[1-9]\d*$/.test(String(beforeId)) || !Number.isSafeInteger(Number(beforeId)))) return res.status(400).json({ success: false, message: 'Mã thông báo không hợp lệ' });
+      await NotificationModel.markAllAsRead(userId, role, beforeId ?? null);
       res.json({ success: true, message: 'Đã đánh dấu đọc tất cả' });
     } catch (error) {
       console.error('Error marking all notifications as read:', error);

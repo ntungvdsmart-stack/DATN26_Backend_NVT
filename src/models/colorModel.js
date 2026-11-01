@@ -19,10 +19,7 @@ const ColorModel = {
         );
         return result.affectedRows;
     },
-    delete: async (id) => {
-        const [result] = await pool.query('DELETE FROM colors WHERE color_id = ?', [id]);
-        return result.affectedRows;
-    }
+    delete: async (id, accountId) => require('../services/referenceDeletionService').deleteReference('colors', id, accountId)
 };
 
 module.exports = ColorModel;

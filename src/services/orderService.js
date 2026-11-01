@@ -2,6 +2,7 @@ const pool = require('../config/database');
 const StripeService = require('./stripeService');
 const NotificationService = require('./notificationService');
 const LoyaltyService = require('./loyaltyService');
+const GatewayService = require('./gatewayService');
 const { getIO, ROOMS } = require('../config/socket');
 
 /* ============================================================================
@@ -23,13 +24,13 @@ const TRANSITIONS = {
     confirmed: ['processing', 'cancelled'],
     processing: ['shipping', 'cancelled'],
     shipping: ['completed', 'returned'], // returned = giao thất bại / khách từ chối nhận
-    completed: ['returned'],
+    completed: [],
     cancelled: [],
     returned: []
 };
 
-const ONLINE_PAYMENT_METHODS = ['cash', 'stripe'];
-const POS_PAYMENT_METHODS = ['cash', 'bank_transfer'];
+const ONLINE_PAYMENT_METHODS = ['cash', 'stripe', 'vnpay', 'momo'];
+const POS_PAYMENT_METHODS = ['cash', 'bank_transfer', 'qr_pos'];
 const PAYMENT_LABELS = { cash: 'Tiền mặt', stripe: 'Thẻ (Stripe)', bank_transfer: 'Chuyển khoản', qr_pos: 'Quét QR', vnpay: 'VNPay', momo: 'MoMo' };
 const STRIPE_MIN_AMOUNT = 15000; // ~0.5 USD – mức tối thiểu Stripe chấp nhận
 const CUSTOMER_CANCEL_HOURS = 24;
@@ -44,13 +45,14 @@ const money = (n) => `${Number(n || 0).toLocaleString('vi-VN')}đ`;
 
 /** Chuẩn hóa danh sách sản phẩm gửi lên: gộp trùng variant, ép kiểu, validate */
 const normalizeItems = (items) => {
-    if (!Array.isArray(items) || items.length === 0) throw httpError(400, 'Giỏ hàng trống');
+    if (!Array.isArray(items) || items.length === 0 || items.length > 500) throw httpError(400, 'Giỏ hàng cần có từ 1 đến 500 dòng sản phẩm');
     const map = new Map();
     for (const raw of items) {
+        if (!raw || typeof raw !== 'object') throw httpError(400, 'Sản phẩm không hợp lệ');
         const variantId = Number(raw.variant_id ?? raw.id);
         const qty = Number(raw.quantity ?? raw.qty);
         if (!Number.isInteger(variantId) || variantId <= 0) throw httpError(400, 'Sản phẩm không hợp lệ');
-        if (!Number.isInteger(qty) || qty <= 0) throw httpError(400, 'Số lượng sản phẩm không hợp lệ');
+        if (!Number.isSafeInteger(qty) || qty <= 0 || qty > 2147483647 || (map.get(variantId) || 0) + qty > 2147483647) throw httpError(400, 'Số lượng sản phẩm không hợp lệ');
         map.set(variantId, (map.get(variantId) || 0) + qty);
     }
     return [...map.entries()].map(([variant_id, quantity]) => ({ variant_id, quantity }));
@@ -71,6 +73,7 @@ const loadVariants = async (conn, items) => {
         const v = byId.get(item.variant_id);
         if (!v) throw httpError(400, `Sản phẩm (mã biến thể ${item.variant_id}) không tồn tại`);
         if (!v.variant_active || !v.product_active) throw httpError(400, `Sản phẩm "${v.product_name}" (${v.sku}) đã ngừng kinh doanh`);
+        if (!Number.isFinite(Number(v.price)) || Number(v.price) < 0) throw httpError(400, 'Giá sản phẩm không hợp lệ');
         return { ...item, unit_price: Number(v.price), sku: v.sku, product_name: v.product_name };
     });
 };
@@ -110,6 +113,22 @@ const emitOrdersChanged = (orderId, type = 'UPDATED') => {
  * SERVICE
  * ==========================================================================*/
 const OrderService = {
+    quote: async ({ items, channel = 'online', customerId, promoCode, promotionId }) => {
+        if (!['online','pos'].includes(channel)) throw httpError(400, 'Kênh bán không hợp lệ');
+        const lines = await loadVariants(pool, normalizeItems(items));
+        const subtotal = lines.reduce((sum, line) => sum + line.unit_price * line.quantity, 0);
+        const promotion = promoCode || promotionId ? await OrderService.evaluatePromotion({ code: promoCode, promotionId, subtotal, channel, customerId }) : null;
+        const discount = promotion?.discount_amount || 0;
+        let loyaltyDiscount = 0;
+        if (customerId) {
+            const [[customer]] = await pool.query('SELECT loyalty_points FROM customers WHERE customer_id = ? AND is_active = 1', [customerId]);
+            if (!customer) throw httpError(400, 'Khách hàng không hoạt động');
+            loyaltyDiscount = LoyaltyService.calcDiscount(Number(customer.loyalty_points), Math.max(0, subtotal - discount)).amount;
+        }
+        const config = await getShippingConfig();
+        const shipping = channel === 'online' && subtotal < config.threshold ? config.fee : 0;
+        return { subtotal_amount: subtotal, discount_amount: discount, loyalty_discount: loyaltyDiscount, shipping_fee: shipping, total_amount: Math.max(0, subtotal - discount - loyaltyDiscount + shipping), lines };
+    },
     STATUS_LABELS,
     TRANSITIONS,
     POS_PAYMENT_METHODS,
@@ -123,10 +142,10 @@ const OrderService = {
     evaluatePromotion: async ({ code, promotionId, subtotal, channel, customerId }, conn = pool) => {
         let promo = null;
         if (promotionId) {
-            const [rows] = await conn.query('SELECT * FROM promotions WHERE promotion_id = ?', [promotionId]);
+            const [rows] = await conn.query('SELECT * FROM promotions WHERE promotion_id = ? FOR UPDATE', [promotionId]);
             promo = rows[0];
         } else if (code) {
-            const [rows] = await conn.query('SELECT * FROM promotions WHERE promo_code = ?', [String(code).trim().toUpperCase()]);
+            const [rows] = await conn.query('SELECT * FROM promotions WHERE promo_code = ? FOR UPDATE', [String(code).trim().toUpperCase()]);
             promo = rows[0];
         }
         if (!promo) throw httpError(404, 'Mã giảm giá không tồn tại');
@@ -181,13 +200,15 @@ const OrderService = {
     /* ------------------------------------------------------------------------
      * ĐƠN ONLINE
      * ----------------------------------------------------------------------*/
-    createOnlineOrder: async ({ customerId, customer = {}, items, paymentMethod = 'cash', shippingAddress, latitude, longitude, promoCode, promotionId, note, frontendUrl }) => {
+    createOnlineOrder: async ({ customerId, customer = {}, items, paymentMethod = 'cash', shippingAddress, latitude, longitude, promoCode, promotionId, note, frontendUrl, ipAddress }) => {
         const method = paymentMethod === 'cod' ? 'cash' : paymentMethod;
         if (!ONLINE_PAYMENT_METHODS.includes(method)) throw httpError(400, 'Phương thức thanh toán không được hỗ trợ');
+        if (['vnpay', 'momo'].includes(method) && !GatewayService.available()[method]) throw httpError(503, 'Cổng thanh toán chưa được cấu hình. Vui lòng chọn phương thức khác');
 
         const fullName = String(customer.fullName || '').trim();
         const phone = String(customer.phone || '').trim();
         const address = String(shippingAddress || '').trim();
+        if ((latitude != null || longitude != null) && !require('./branchDistanceService').coordinates(latitude, longitude)) throw httpError(400, 'Tọa độ giao hàng không hợp lệ');
         if (!fullName || !phone || !address) throw httpError(400, 'Vui lòng nhập đầy đủ họ tên, số điện thoại và địa chỉ nhận hàng');
         if (!/^(0|\+84)\d{9,10}$/.test(phone.replace(/[\s.]/g, ''))) throw httpError(400, 'Số điện thoại không hợp lệ');
 
@@ -237,7 +258,7 @@ const OrderService = {
                     shipping_latitude, shipping_longitude, note)
                  VALUES (?, 'online', ?, ?, NULL, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [orderCode, customerId || null, branchId, subtotal, discount, loyaltyDiscount, shippingFee, total, snapshot,
-                 latitude || null, longitude || null, note ? String(note).slice(0, 500) : null]
+                 latitude ?? null, longitude ?? null, note ? String(note).slice(0, 500) : null]
             );
             const orderId = orderRes.insertId;
 
@@ -294,6 +315,14 @@ const OrderService = {
                 }).catch(() => {});
                 throw httpError(502, 'Không kết nối được cổng thanh toán Stripe: ' + err.message);
             }
+        } else if (['vnpay', 'momo'].includes(method)) {
+            try {
+                await pool.query('UPDATE payments SET transaction_code = ? WHERE order_id = ?', [result.order_code, result.order_id]);
+                result.checkoutUrl = await GatewayService.createPayment({ method, orderCode: result.order_code, amount: Math.round(result.total_amount), frontendUrl, ipAddress });
+            } catch (error) {
+                await OrderService.updateOrderStatus(result.order_id, 'cancelled', { note: 'Không tạo được phiên thanh toán', silent: true });
+                throw httpError(502, error.message);
+            }
         } else {
             NotificationService.notifyStaff({
                 content: `🛒 Đơn online mới ${result.order_code} (COD) – ${money(result.total_amount)}. Vui lòng xác nhận!`,
@@ -307,6 +336,7 @@ const OrderService = {
                 : `Đặt hàng thành công! Đơn ${result.order_code} đang chờ cửa hàng xác nhận.`,
             orderId: result.order_id
         });
+        void require('./orderEmailService').sendOrderEmail(result.order_id, 'pending');
         return result;
     },
 
@@ -324,7 +354,7 @@ const OrderService = {
                  FROM orders o JOIN payments p ON p.order_id = o.order_id WHERE o.order_id = ? FOR UPDATE`,
                 [orderId]
             );
-            if (!rows.length || rows[0].payment_status === 'success') { await connection.rollback(); return false; }
+            if (!rows.length || ['success', 'refunded'].includes(rows[0].payment_status)) { await connection.rollback(); return false; }
             order = rows[0];
 
             await connection.query(
@@ -335,7 +365,7 @@ const OrderService = {
                 await connection.query("UPDATE orders SET order_status = 'confirmed' WHERE order_id = ?", [orderId]);
                 await connection.query(
                     'INSERT INTO order_status_history (order_id, status, changed_by, note) VALUES (?, ?, NULL, ?)',
-                    [orderId, 'confirmed', 'Thanh toán Stripe thành công – hệ thống tự động xác nhận']
+                    [orderId, 'confirmed', 'Thanh toán online thành công – hệ thống tự động xác nhận']
                 );
             } else if (order.order_status === 'cancelled') {
                 // Khách trả tiền sau khi đơn đã bị hủy (hết hạn) → ghi chú để nhân viên hoàn tiền
@@ -368,6 +398,8 @@ const OrderService = {
     syncStripeSession: async (orderId, sessionId) => {
         const session = await StripeService.retrieveSession(sessionId);
         if (session.payment_status === 'paid') {
+            const [[order]] = await pool.query('SELECT total_amount FROM orders WHERE order_id = ?', [orderId]);
+            if (!order || Number(session.metadata?.orderId) !== Number(orderId) || session.currency !== 'vnd' || Number(session.amount_total) !== Math.round(Number(order.total_amount))) throw httpError(400, 'Giao dịch không khớp với đơn hàng');
             await OrderService.markOrderPaid(orderId, session.payment_intent);
             return 'paid';
         }
@@ -468,7 +500,7 @@ const OrderService = {
     /* ------------------------------------------------------------------------
      * CẬP NHẬT TRẠNG THÁI (dùng chung cho nhân viên / khách / hệ thống)
      * ----------------------------------------------------------------------*/
-    updateOrderStatus: async (orderId, newStatus, { accountId = null, note = '', silent = false } = {}) => {
+    updateOrderStatus: async (orderId, newStatus, { accountId = null, note = '', silent = false, pickup = false, actorBranchId = null, isAdmin = false } = {}) => {
         if (!STATUS_LABELS[newStatus]) throw httpError(400, 'Trạng thái đơn hàng không hợp lệ');
 
         const connection = await pool.getConnection();
@@ -485,15 +517,20 @@ const OrderService = {
             if (!rows.length) throw httpError(404, 'Không tìm thấy đơn hàng');
             order = rows[0];
             const current = order.order_status;
+            if (accountId && !isAdmin && actorBranchId != null && order.channel === 'online' && Number(order.staff_id) !== Number(accountId)) throw httpError(403, 'Chỉ nhân viên được phân công mới được xử lý đơn online');
+            if (accountId && !isAdmin && actorBranchId != null && Number(order.branch_id) !== Number(actorBranchId)) throw httpError(403, 'Không được xử lý đơn của chi nhánh khác');
 
-            if (!(TRANSITIONS[current] || []).includes(newStatus)) {
+            const pickupAllowed = pickup && newStatus === 'completed' && order.channel === 'online' && ['pending','confirmed','processing'].includes(current);
+            if (pickup && (!pickupAllowed || (!isAdmin && Number(order.branch_id) !== Number(actorBranchId)))) throw httpError(400, 'Chỉ nhận hàng tại quầy cho đơn online được phân công đúng chi nhánh và chưa giao');
+            if (!(TRANSITIONS[current] || []).includes(newStatus) && !pickupAllowed) {
                 throw httpError(400, `Không thể chuyển đơn từ "${STATUS_LABELS[current]}" sang "${STATUS_LABELS[newStatus]}"`);
             }
             // Đơn Stripe chưa trả tiền thì không được đưa vào xử lý
-            if (['confirmed', 'processing', 'shipping'].includes(newStatus)
-                && order.payment_method === 'stripe' && order.payment_status !== 'success') {
+            if (['confirmed', 'processing', 'shipping', 'completed'].includes(newStatus)
+                && ['stripe', 'vnpay', 'momo'].includes(order.payment_method) && order.payment_status !== 'success') {
                 throw httpError(400, 'Đơn thanh toán thẻ chưa được thanh toán, không thể xử lý');
             }
+            if (['processing', 'shipping', 'completed'].includes(newStatus) && !order.branch_id) throw httpError(400, 'Cần phân công chi nhánh và giữ tồn kho trước khi xử lý đơn hàng');
 
             // ---- Hoàn kho khi hủy / hoàn trả ----
             if (newStatus === 'cancelled' || newStatus === 'returned') {
@@ -519,16 +556,16 @@ const OrderService = {
                 } else if (order.payment_status === 'success') {
                     if (order.payment_method === 'stripe' && order.transaction_code && order.transaction_code.startsWith('pi_')) {
                         // Hoàn tiền Stripe trước khi commit – nếu lỗi thì rollback, đơn giữ nguyên
-                        await StripeService.refund(order.transaction_code);
+                        await StripeService.refund(order.transaction_code, undefined, `cancel-order-${orderId}`);
                         refundInfo = 'Đã hoàn tiền tự động về thẻ.';
                     } else {
                         refundInfo = `Cần hoàn ${money(order.paid_amount)} cho khách (${PAYMENT_LABELS[order.payment_method] || order.payment_method}).`;
                     }
-                    await connection.query("UPDATE payments SET payment_status = 'refunded' WHERE order_id = ?", [orderId]);
+                    if (order.payment_method === 'stripe' && order.transaction_code?.startsWith('pi_')) await connection.query("UPDATE payments SET payment_status = 'refunded' WHERE order_id = ?", [orderId]);
                     await connection.query(
                         'INSERT INTO payment_refunds (payment_id, amount, reason, status, processed_by) VALUES (?, ?, ?, ?, ?)',
                         [order.payment_id, order.paid_amount, note || `Đơn chuyển sang ${STATUS_LABELS[newStatus]}`,
-                         order.payment_method === 'stripe' ? 'completed' : 'pending', accountId]
+                         order.payment_method === 'stripe' && order.transaction_code?.startsWith('pi_') ? 'completed' : 'pending', accountId]
                     );
                 }
             }
@@ -554,6 +591,7 @@ const OrderService = {
         }
 
         if (!silent) {
+            void require('./orderEmailService').sendOrderEmail(orderId, newStatus);
             const customerMsg = {
                 confirmed: 'đã được cửa hàng xác nhận',
                 processing: 'đang được chuẩn bị',
@@ -615,8 +653,9 @@ const OrderService = {
     /* ------------------------------------------------------------------------
      * ĐƠN POS (BÁN TẠI QUẦY)
      * ----------------------------------------------------------------------*/
-    createPOSOrder: async ({ staffId, branchId, customerId, items, paymentMethod = 'cash', promoCode, promotionId, cashReceived, note }) => {
+    createPOSOrder: async ({ staffId, branchId, customerId, items, paymentMethod = 'cash', promoCode, promotionId, cashReceived, note, bankTransferConfirmed }) => {
         if (!POS_PAYMENT_METHODS.includes(paymentMethod)) throw httpError(400, 'Phương thức thanh toán không hợp lệ');
+        if (['bank_transfer','qr_pos'].includes(paymentMethod) && bankTransferConfirmed !== true) throw httpError(400, 'Cần xác nhận tiền đã vào tài khoản trước khi hoàn tất đơn');
         const normalized = normalizeItems(items);
         const branch = branchId || 1;
 
@@ -624,6 +663,8 @@ const OrderService = {
         let orderId, orderCode, total, change = 0;
         try {
             await connection.beginTransaction();
+            const [[activeBranch]] = await connection.query('SELECT branch_id FROM branches WHERE branch_id = ? AND is_active = 1', [branch]);
+            if (!activeBranch) throw httpError(400, 'Chi nhánh đã ngừng hoạt động');
 
             if (customerId) {
                 const [c] = await connection.query('SELECT customer_id FROM customers WHERE customer_id = ?', [customerId]);
@@ -729,30 +770,14 @@ const OrderService = {
      * PHÂN CÔNG ĐƠN HÀNG ONLINE
      * ----------------------------------------------------------------------*/
     getBranchSuggestions: async (orderId) => {
-        const [orders] = await pool.query('SELECT shipping_latitude, shipping_longitude FROM orders WHERE order_id = ?', [orderId]);
+        const [orders] = await pool.query('SELECT shipping_latitude, shipping_longitude, shipping_address_snapshot FROM orders WHERE order_id = ?', [orderId]);
         if (!orders.length) throw httpError(404, 'Đơn hàng không tồn tại');
-        const { shipping_latitude, shipping_longitude } = orders[0];
 
         const [items] = await pool.query('SELECT variant_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
         const variantIds = items.map(i => i.variant_id);
 
-        let branchesQuery = 'SELECT branch_id, branch_name, address, latitude, longitude FROM branches WHERE is_active = 1';
-        let branchesParams = [];
-        if (shipping_latitude && shipping_longitude) {
-            branchesQuery = `
-                SELECT branch_id, branch_name, address, latitude, longitude,
-                  (6371 * acos(LEAST(1, cos(radians(?)) * cos(radians(latitude)) * cos(radians(longitude) - radians(?))
-                   + sin(radians(?)) * sin(radians(latitude))))) AS distance
-                FROM branches WHERE is_active = 1 AND latitude IS NOT NULL AND longitude IS NOT NULL
-                UNION
-                SELECT branch_id, branch_name, address, latitude, longitude, 999999 AS distance
-                FROM branches WHERE is_active = 1 AND (latitude IS NULL OR longitude IS NULL)
-                ORDER BY distance ASC
-            `;
-            branchesParams = [shipping_latitude, shipping_longitude, shipping_latitude];
-        }
-
-        const [branches] = await pool.query(branchesQuery, branchesParams);
+        const [activeBranches] = await pool.query('SELECT branch_id, branch_name, address, latitude, longitude FROM branches WHERE is_active = 1');
+        const branches = await require('./branchDistanceService').rankBranches(orders[0], activeBranches);
 
         const result = [];
         for (const b of branches) {
@@ -768,11 +793,11 @@ const OrderService = {
                 }
             }
 
-            const [staff] = await pool.query('SELECT account_id, full_name, email FROM accounts WHERE branch_id = ? AND role = "staff" AND is_active = 1', [b.branch_id]);
+            const [staff] = await pool.query('SELECT account_id, full_name, email FROM accounts WHERE branch_id = ? AND role_id = 2 AND is_active = 1 AND EXISTS (SELECT 1 FROM role_permissions rp JOIN permissions perm ON perm.permission_id=rp.permission_id WHERE rp.role_id=accounts.role_id AND perm.permission_code=\'orders.manage\')', [b.branch_id]);
 
             result.push({
                 ...b,
-                distance: b.distance === 999999 ? null : b.distance,
+                distance: b.distance ?? null,
                 hasEnoughStock,
                 staff
             });
@@ -781,17 +806,21 @@ const OrderService = {
     },
 
     assignOrder: async (orderId, branchId, staffId, accountId) => {
+        if (![orderId, branchId, staffId].every(value => ['number','string'].includes(typeof value) && /^[1-9]\d*$/.test(String(value)) && Number.isSafeInteger(Number(value)))) throw httpError(400, 'Ch\u1ecdn \u0111\u01a1n, chi nh\u00e1nh v\u00e0 nh\u00e2n vi\u00ean h\u1ee3p l\u1ec7');
         const connection = await pool.getConnection();
         try {
             await connection.beginTransaction();
-            const [rows] = await connection.query('SELECT order_status, branch_id FROM orders WHERE order_id = ? FOR UPDATE', [orderId]);
+            const [rows] = await connection.query('SELECT order_status, branch_id, staff_id, channel, order_code FROM orders WHERE order_id = ? FOR UPDATE', [orderId]);
             if (!rows.length) throw httpError(404, 'Đơn hàng không tồn tại');
             const order = rows[0];
 
-            if (order.branch_id) {
-                throw httpError(400, 'Đơn hàng đã được phân công chi nhánh');
+            if (order.channel !== 'online') throw httpError(400, 'Ch\u1ec9 ph\u00e2n c\u00f4ng \u0111\u01a1n online');
+            if (order.branch_id || order.staff_id) {
+                throw httpError(409, 'Đơn hàng đã được phân công, không thể phân công lại');
             }
-            if (order.order_status === 'cancelled' || order.order_status === 'returned') {
+            const [[staff]] = await connection.query('SELECT a.account_id FROM accounts a JOIN branches b ON b.branch_id = a.branch_id WHERE a.account_id = ? AND a.branch_id = ? AND a.is_active = 1 AND a.role_id = 2 AND b.is_active = 1 AND EXISTS (SELECT 1 FROM role_permissions rp JOIN permissions perm ON perm.permission_id=rp.permission_id WHERE rp.role_id=a.role_id AND perm.permission_code=\'orders.manage\') FOR UPDATE', [staffId, branchId]);
+            if (!staff) throw httpError(400, 'Nhân viên không thuộc chi nhánh hoặc đã ngừng hoạt động');
+            if (['cancelled', 'returned', 'completed', 'shipping'].includes(order.order_status)) {
                 throw httpError(400, 'Không thể phân công đơn hàng đã hủy hoặc hoàn trả');
             }
 
@@ -834,14 +863,7 @@ const OrderService = {
 
             // Thông báo cho nhân viên được gán
             if (staffId) {
-                const io = getIO();
-                if (io) {
-                    io.to(`account_${staffId}`).emit('new_notification', {
-                        notif_type: 'order_assigned',
-                        content: `Bạn vừa được phân công xử lý một đơn hàng mới.`,
-                        created_at: new Date()
-                    });
-                }
+                await NotificationService.notifySingleStaff({ accountId: staffId, content: `Bạn được phân công xử lý đơn hàng ${order.order_code}`, orderId, type: 'ORDER_ASSIGNED' });
             }
             emitOrdersChanged(orderId, 'ASSIGNED');
             
@@ -856,12 +878,13 @@ const OrderService = {
     /* ------------------------------------------------------------------------
      * TRUY VẤN
      * ----------------------------------------------------------------------*/
-    listOrders: async ({ page = 1, limit = 10, status, channel, payment_status, search, date_from, date_to, branch_id } = {}) => {
+    listOrders: async ({ page = 1, limit = 10, status, channel, payment_status, search, date_from, date_to, branch_id, assigned_staff_id } = {}) => {
         const where = [];
         const params = [];
         if (channel && ['online', 'pos'].includes(channel)) { where.push('o.channel = ?'); params.push(channel); }
         if (payment_status) { where.push('p.payment_status = ?'); params.push(payment_status); }
         if (branch_id) { where.push('o.branch_id = ?'); params.push(branch_id); }
+        if (assigned_staff_id) { where.push('o.staff_id = ?'); params.push(assigned_staff_id); }
         if (date_from) { where.push('o.created_at >= ?'); params.push(`${date_from} 00:00:00`); }
         if (date_to) { where.push('o.created_at <= ?'); params.push(`${date_to} 23:59:59`); }
         if (search && String(search).trim()) {
@@ -895,7 +918,7 @@ const OrderService = {
 
         const [items] = await pool.query(
             `SELECT o.order_id, o.order_code, o.channel, o.order_status, o.subtotal_amount, o.discount_amount,
-                    o.shipping_fee, o.total_amount, o.created_at, o.shipping_address_snapshot, o.customer_id,
+                    o.shipping_fee, o.total_amount, o.created_at, o.shipping_address_snapshot, o.customer_id, o.branch_id, o.staff_id,
                     c.full_name AS customer_name, c.phone AS customer_phone,
                     a.full_name AS staff_name, b.branch_name,
                     p.payment_method, p.payment_status,
@@ -968,7 +991,7 @@ const OrderService = {
         order.history = history;
         order.allowed_transitions = TRANSITIONS[order.order_status] || [];
         order.can_customer_cancel = order.channel === 'online'
-            && ['pending', 'confirmed'].includes(order.order_status)
+            && order.order_status === 'pending'
             && (Date.now() - new Date(order.created_at).getTime()) / 36e5 <= CUSTOMER_CANCEL_HOURS;
         order.awaiting_payment = order.payment_method === 'stripe' && order.payment_status === 'pending' && order.order_status === 'pending';
         // Không lộ mã giao dịch ra ngoài
@@ -987,9 +1010,16 @@ const OrderService = {
         try {
             await connection.beginTransaction();
 
-            const [orders] = await connection.query('SELECT order_code FROM orders WHERE order_id = ?', [orderId]);
+            const [orders] = await connection.query('SELECT order_code, order_status FROM orders WHERE order_id = ? FOR UPDATE', [orderId]);
             if (!orders.length) throw httpError(404, 'Đơn hàng không tồn tại');
+            const [[financial]] = await connection.query("SELECT COUNT(*) AS count FROM payments WHERE order_id = ? AND payment_status IN ('success','refunded')", [orderId]);
+            if (orders[0].order_status !== 'cancelled' || Number(financial.count) > 0) throw httpError(409, 'Chỉ xóa đơn đã hủy và chưa có giao dịch thu tiền. Đơn có giao dịch phải được giữ để đối soát');
             const orderCode = orders[0].order_code;
+            const [[history]] = await connection.query(`SELECT
+                EXISTS(SELECT 1 FROM customer_reviews WHERE order_id = ?) AS has_reviews,
+                EXISTS(SELECT 1 FROM order_returns WHERE order_id = ?) AS has_returns,
+                EXISTS(SELECT 1 FROM payment_refunds r JOIN payments p ON p.payment_id = r.payment_id WHERE p.order_id = ?) AS has_refunds`, [orderId, orderId, orderId]);
+            if (history.has_reviews || history.has_returns || history.has_refunds) throw httpError(409, 'Đơn có lịch sử đánh giá, đổi trả hoặc hoàn tiền cần được giữ để đối soát, không thể xóa');
 
             // Xóa các bảng phụ trước
             await connection.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
@@ -1015,84 +1045,7 @@ const OrderService = {
         }
     },
 
-    getBranchSuggestions: async (orderId) => {
-        const [orders] = await pool.query('SELECT shipping_latitude, shipping_longitude FROM orders WHERE order_id = ?', [orderId]);
-        if (!orders.length) throw { statusCode: 404, message: 'Đơn hàng không tồn tại' };
-        const order = orders[0];
-        
-        const [branches] = await pool.query('SELECT branch_id, branch_name, address, latitude, longitude FROM branches WHERE is_active = 1');
-        
-        const R = 6371; 
-        const deg2rad = (deg) => deg * (Math.PI / 180);
-        
-        const suggestions = branches.map(b => {
-            let distance = null;
-            if (order.shipping_latitude && order.shipping_longitude && b.latitude && b.longitude) {
-                const dLat = deg2rad(b.latitude - order.shipping_latitude);
-                const dLon = deg2rad(b.longitude - order.shipping_longitude);
-                const a = 
-                    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-                    Math.cos(deg2rad(order.shipping_latitude)) * Math.cos(deg2rad(b.latitude)) * 
-                    Math.sin(dLon / 2) * Math.sin(dLon / 2); 
-                const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)); 
-                distance = R * c; 
-            }
-            return {
-                ...b,
-                distance,
-                hasEnoughStock: true
-            };
-        });
-        
-        suggestions.sort((a, b) => {
-            if (a.distance === null) return 1;
-            if (b.distance === null) return -1;
-            return a.distance - b.distance;
-        });
-        
-        for (let i = 0; i < suggestions.length; i++) {
-            const [staffs] = await pool.query('SELECT account_id, full_name FROM accounts WHERE branch_id = ? AND is_active = 1 AND role_id = 2', [suggestions[i].branch_id]);
-            suggestions[i].staff = staffs;
-        }
 
-        return suggestions;
-    },
-
-    assignOrder: async (orderId, branchId, staffId, adminId) => {
-        const [order] = await pool.query('SELECT order_status FROM orders WHERE order_id = ?', [orderId]);
-        if (!order.length) throw { statusCode: 404, message: 'Đơn hàng không tồn tại' };
-        
-        let updates = [];
-        let params = [];
-        if (branchId !== undefined) {
-            updates.push('branch_id = ?');
-            params.push(branchId || null);
-        }
-        if (staffId !== undefined) {
-            updates.push('staff_id = ?');
-            params.push(staffId || null);
-        }
-        
-        if (updates.length > 0) {
-            params.push(orderId);
-            await pool.query(`UPDATE orders SET ${updates.join(', ')} WHERE order_id = ?`, params);
-            
-            await pool.query(
-                'INSERT INTO order_status_history (order_id, status, note, changed_by) VALUES (?, ?, ?, ?)',
-                [orderId, order[0].order_status, `Phân đơn: branch_id=${branchId || 'trống'}, staff_id=${staffId || 'trống'}`, adminId]
-            );
-
-            if (staffId) {
-                await NotificationService.notifySingleStaff({
-                    accountId: staffId,
-                    content: `Bạn có đơn đặt hàng mới cần xử lý (Mã: ${orderId})`,
-                    orderId: orderId,
-                    type: 'ORDER_ASSIGNED'
-                });
-            }
-        }
-        return true;
-    }
 };
 
 module.exports = OrderService;

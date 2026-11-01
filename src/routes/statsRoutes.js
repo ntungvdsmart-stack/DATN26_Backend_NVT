@@ -4,10 +4,11 @@ const StatsController = require('../controllers/statsController');
 const { protect, authorize } = require('../middlewares/authMiddleware');
 
 const staffOrAdmin = [protect, authorize('admin', 'staff')];
+router.get('/report', protect, authorize('admin'), require('../controllers/reportController').getReport);
+router.get('/order-workload', protect, authorize('staff'), require('../controllers/staffOrderStatsController').get);
 
 router.get('/kpi', ...staffOrAdmin, StatsController.getKPIs);
 router.get('/revenue', ...staffOrAdmin, StatsController.getRevenueChart);
-router.get('/top-products', ...staffOrAdmin, StatsController.getTopProducts);
 router.get('/top-products', ...staffOrAdmin, StatsController.getTopProducts);
 router.get('/category', ...staffOrAdmin, StatsController.getCategoryStats);
 router.get('/payments', ...staffOrAdmin, StatsController.getPaymentStats);

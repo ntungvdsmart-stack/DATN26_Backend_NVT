@@ -1,6 +1,7 @@
 const bcrypt = require('bcryptjs');
 const AccountModel = require('../models/accountModel');
 const { sendResponse } = require('../utils/responseHelper');
+const validPhone = value => value == null || value === '' || (typeof value === 'string' && /^(0\d{9}|\+84\d{9})$/.test(value));
 
 const AccountController = {
     // 1. Lấy danh sách tất cả tài khoản nội bộ
@@ -24,10 +25,16 @@ const AccountController = {
     createAccount: async (req, res, next) => {
         try {
             const { full_name, email, phone, password, role_id, branch_id } = req.body;
+            if (!validPhone(phone)) return sendResponse(res, 400, false, 'Số điện thoại không hợp lệ');
 
             // Validate cơ bản
             if (!full_name || !email || !password || !role_id) {
                 return sendResponse(res, 400, false, 'Vui lòng cung cấp đầy đủ thông tin bắt buộc (full_name, email, password, role_id)');
+            }
+            if (typeof full_name !== 'string' || full_name.trim().length < 2 || full_name.length > 150 || typeof email !== 'string' || email.length > 150 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || typeof password !== 'string' || password.length < 8 || Buffer.byteLength(password) > 72 || ![1,2].includes(Number(role_id))) return sendResponse(res, 400, false, 'Họ tên, email, vai trò hoặc mật khẩu không hợp lệ (mật khẩu từ 8 ký tự)');
+            if (Number(role_id) !== 1) {
+                const [[branch]] = await require('../config/database').query('SELECT branch_id FROM branches WHERE branch_id = ? AND is_active = 1', [branch_id || null]);
+                if (!branch) return sendResponse(res, 400, false, 'Nhân viên cần thuộc một chi nhánh đang hoạt động');
             }
 
             // Kiểm tra trùng email
@@ -67,9 +74,16 @@ const AccountController = {
         try {
             const { id } = req.params;
             const { full_name, phone, role_id, branch_id } = req.body;
+            if (!validPhone(phone)) return sendResponse(res, 400, false, 'Số điện thoại không hợp lệ');
 
             if (!full_name || !role_id) {
                 return sendResponse(res, 400, false, 'Họ tên và vai trò là bắt buộc');
+            }
+            if (typeof full_name !== 'string' || full_name.trim().length < 2 || full_name.length > 150 || ![1,2].includes(Number(role_id)) || (Number(role_id) !== 1 && !Number(branch_id))) return sendResponse(res, 400, false, 'Họ tên, vai trò hoặc chi nhánh không hợp lệ');
+            if (Number(id) === Number(req.user.id) && Number(role_id) !== 1) return sendResponse(res, 403, false, 'Không thể tự bỏ quyền quản trị');
+            if (Number(role_id) !== 1) {
+                const [[branch]] = await require('../config/database').query('SELECT branch_id FROM branches WHERE branch_id = ? AND is_active = 1', [branch_id]);
+                if (!branch) return sendResponse(res, 400, false, 'Chi nhánh không hoạt động');
             }
 
             // Không cho phép sửa thông tin của tài khoản "admin" gốc (hardcoded bảo vệ)
@@ -77,7 +91,7 @@ const AccountController = {
                 return sendResponse(res, 403, false, 'Không thể chỉnh sửa tài khoản Admin hệ thống');
             }
 
-            await AccountModel.update(id, { full_name, phone, role_id, branch_id });
+            if (!await AccountModel.update(id, { full_name, phone: phone || null, role_id, branch_id })) return sendResponse(res, 404, false, 'Không tìm thấy tài khoản');
 
             AccountModel.logActivity({
                 account_id: req.user.id,
@@ -100,7 +114,7 @@ const AccountController = {
             const { id } = req.params;
             const { is_active } = req.body; // 1 hoặc 0
 
-            if (is_active === undefined) {
+            if (![0, 1, true, false].includes(is_active)) {
                 return sendResponse(res, 400, false, 'Trạng thái is_active không được cung cấp');
             }
 
@@ -109,7 +123,7 @@ const AccountController = {
                 return sendResponse(res, 403, false, 'Bạn không thể tự khóa tài khoản của chính mình');
             }
 
-            await AccountModel.toggleStatus(id, is_active ? 1 : 0);
+            if (!await AccountModel.toggleStatus(id, is_active ? 1 : 0)) return sendResponse(res, 404, false, 'Không tìm thấy tài khoản');
 
             AccountModel.logActivity({
                 account_id: req.user.id,
@@ -131,7 +145,7 @@ const AccountController = {
             const pool = require('../config/database');
             const [rows] = await pool.query(`
                 SELECT a.account_id, a.full_name, a.email, a.phone, a.is_active, a.created_at, 
-                       r.role_name as role, b.branch_name, b.branch_id
+                       a.role_id, a.username, r.role_name as role_name, b.branch_name, b.branch_id
                 FROM accounts a
                 JOIN roles r ON a.role_id = r.role_id
                 LEFT JOIN branches b ON a.branch_id = b.branch_id
@@ -139,7 +153,7 @@ const AccountController = {
             `, [req.user.id]);
             
             if (rows.length === 0) return sendResponse(res, 404, false, 'Không tìm thấy tài khoản');
-            sendResponse(res, 200, true, 'Lấy thông tin thành công', rows[0]);
+            sendResponse(res, 200, true, 'Lấy thông tin thành công', { ...rows[0], id: req.user.id, role: req.user.role, permissions: req.user.permissions });
         } catch (error) {
             next(error);
         }
@@ -147,19 +161,23 @@ const AccountController = {
 
     updateMe: async (req, res, next) => {
         try {
-            const { full_name, phone, password } = req.body;
+            const { full_name, password, current_password } = req.body;
+            const phone = typeof req.body.phone === 'string' ? req.body.phone.trim() : req.body.phone;
             const pool = require('../config/database');
             
-            if (!full_name) {
+            if (typeof full_name !== 'string' || full_name.trim().length < 2 || full_name.length > 150 || !validPhone(phone)) {
                 return sendResponse(res, 400, false, 'Họ tên là bắt buộc');
             }
 
             if (password) {
+                if (typeof password !== 'string' || password.length < 8 || Buffer.byteLength(password) > 72) return sendResponse(res, 400, false, 'Mật khẩu mới từ 8 ký tự, tối đa 72 byte');
+                const [[account]] = await pool.query('SELECT password_hash FROM accounts WHERE account_id = ?', [req.user.id]);
+                if (typeof current_password !== 'string' || !await bcrypt.compare(current_password, account.password_hash)) return sendResponse(res, 400, false, 'Mật khẩu hiện tại không đúng');
                 const salt = await bcrypt.genSalt(10);
                 const password_hash = await bcrypt.hash(password, salt);
-                await pool.query('UPDATE accounts SET full_name = ?, phone = ?, password_hash = ? WHERE account_id = ?', [full_name, phone, password_hash, req.user.id]);
+                await pool.query('UPDATE accounts SET full_name = ?, phone = ?, password_hash = ?, auth_version = auth_version + 1 WHERE account_id = ?', [full_name.trim(), phone || null, password_hash, req.user.id]);
             } else {
-                await pool.query('UPDATE accounts SET full_name = ?, phone = ? WHERE account_id = ?', [full_name, phone, req.user.id]);
+                await pool.query('UPDATE accounts SET full_name = ?, phone = ? WHERE account_id = ?', [full_name.trim(), phone || null, req.user.id]);
             }
 
             AccountModel.logActivity({

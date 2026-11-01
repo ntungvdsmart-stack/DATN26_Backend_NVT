@@ -41,6 +41,15 @@ const io = new Server(server, {
     }
 });
 setIO(io); // Cho phép service (OrderService, NotificationService...) phát sự kiện realtime
+const { resolveUser } = require('./src/middlewares/authMiddleware');
+io.use(async (socket, next) => {
+    try {
+        const user = await resolveUser(socket.handshake.auth?.token);
+        if (!user) return next(new Error('Unauthorized'));
+        socket.data.user = user;
+        next();
+    } catch (error) { next(new Error('Authentication unavailable')); }
+});
 
 // Middleware để chia sẻ `io` instance với các controller
 app.use((req, res, next) => {
@@ -53,9 +62,8 @@ io.on('connection', (socket) => {
     // Client tham gia phòng để nhận thông báo:
     //  - payload cũ: accountId (number)  → phòng account_<id>
     //  - payload mới: { id, role }       → nhân viên/admin vào thêm staff_room, khách vào customer_<id>
-    socket.on('join_room', (payload) => {
-        const id = typeof payload === 'object' && payload !== null ? payload.id : payload;
-        const role = typeof payload === 'object' && payload !== null ? payload.role : null;
+    socket.on('join_room', (payload, acknowledge) => {
+        const { id, role } = socket.data.user;
         if (!id) return;
         if (role === 'customer') {
             socket.join(ROOMS.customer(id));
@@ -63,6 +71,7 @@ io.on('connection', (socket) => {
             socket.join(ROOMS.account(id));
             if (role === 'admin' || role === 'staff') socket.join(ROOMS.STAFF);
         }
+        if (typeof acknowledge === 'function') acknowledge({ success: true });
     });
 
     socket.on('disconnect', () => {
@@ -86,6 +95,11 @@ app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripe
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+    if (req.body === undefined) req.body = {};
+    if (['POST', 'PUT', 'PATCH'].includes(req.method) && !req.is('multipart/form-data') && (!req.body || typeof req.body !== 'object' || Array.isArray(req.body))) return res.status(400).json({ success: false, message: 'Nội dung yêu cầu phải là một đối tượng JSON' });
+    next();
+});
 
 // Stripe Verify Route (dùng express.json bình thường)
 const stripeController = require('./src/controllers/stripeController');
@@ -119,15 +133,22 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
+app.use('/api/auth/forgot-password', authLimiter);
+app.use('/api/auth/reset-password', authLimiter);
+app.use('/api/auth/verify-password-otp', authLimiter);
 
 // Thiết lập định tuyến
 app.use('/api/auth', authRoutes);
 app.use('/api/accounts', accountRoutes);
+app.use('/api/roles', require('./src/routes/roleRoutes'));
+app.use('/api/activity-logs', require('./src/routes/activityRoutes'));
 app.use('/api/products', productRoutes);
 app.use('/api/orders', orderRoutes);
+app.use('/api/payments', require('./src/routes/paymentRoutes'));
 app.use('/api/customers', customerRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/support', supportRoutes);
+app.use('/api/customer-chat', require('./src/routes/customerChatRoutes'));
 app.use('/api/inventory', inventoryRoutes);
 app.use('/api/config', configRoutes);
 app.use('/api/reviews', reviewRoutes);
@@ -146,12 +167,15 @@ app.get('/', (req, res) => {
 });
 
 // Middleware xử lý lỗi
+app.use((req, res) => res.status(404).json({ success: false, message: 'Không tìm thấy API', data: null }));
 app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 
 // Đảm bảo schema đầy đủ TRƯỚC khi nhận request → tránh lỗi "Unknown column" ở request đầu tiên
-ensureSchema().finally(() => {
+ensureSchema().then(summary => {
+    const changes = Object.entries(summary).filter(([, value]) => Array.isArray(value) && value.length).map(([key, value]) => `${key}: ${value.length}`);
+    console.log(`[schema] ${changes.length ? changes.join(', ') : 'Đã đủ cấu trúc, không cần bổ sung'}`);
     server.listen(PORT, () => {
         console.log(`Server đang chạy tại port ${PORT}`);
         // Quét các đơn Stripe treo (server restart làm mất polling)
@@ -159,4 +183,4 @@ ensureSchema().finally(() => {
         OrderService.sweepPendingStripeOrders();
         setInterval(() => OrderService.sweepPendingStripeOrders(), 5 * 60 * 1000);
     });
-});
+}).catch(error => { console.error('Không thể khởi động: migration thất bại', error.message); process.exitCode = 1; require('./src/config/database').end(); });

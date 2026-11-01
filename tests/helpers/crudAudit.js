@@ -1,0 +1,77 @@
+const assert = require('node:assert/strict');
+module.exports = async ({ request, admin, staff, customer, otherCustomer }) => {
+    const missing = 2147483000;
+    const attributes = [
+        ['categories','category_name','category_id'], ['brands','brand_name','brand_id'],
+        ['sizes','size_value','size_id'], ['colors','color_name','color_id'], ['materials','material_name','material_id']
+    ];
+    for (const [resource, field, idField] of attributes) {
+        const base = `/products/attributes/${resource}`;
+        const body = { [field]: `Audit ${resource}`, ...(resource === 'colors' ? { hex_code: '#123456' } : {}) };
+        await request(base, admin.token, 'POST', { [field]: {} }, 400);
+        await request(base, staff.token, 'POST', body, 403);
+        const created = (await request(base, admin.token, 'POST', body, 201)).data;
+        assert.ok(created[idField]);
+        await request(`${base}/${created[idField]}`, admin.token, 'PUT', { ...body, [field]: `Edit ${resource}` });
+        await request(`${base}/${missing}`, admin.token, 'PUT', body, 404);
+        await request(`${base}/${created[idField]}`, admin.token, 'DELETE');
+        await request(`${base}/${created[idField]}`, admin.token, 'DELETE', undefined, 404);
+    }
+    await request('/products/attributes/colors', admin.token, 'POST', { color_name: 'Invalid hex', hex_code: '#NOPE' }, 400);
+    await request('/products/attributes/categories/1', admin.token, 'DELETE', undefined, 400);
+    await request(`/products/${missing}/status`, admin.token, 'PATCH', { is_active: true }, 404);
+    await request(`/products/${missing}`, admin.token, 'DELETE', undefined, 404);
+    const product = { product: { product_name: 'Audit invalid price', category_id: 1, base_price: 100000 }, variants: [{ sku: 'AUDIT-PRICE', price: 100000 }], images: [] };
+    for (const price of [null, '', false, 'invalid', 1e15]) await request('/products', admin.token, 'POST', { ...product, product: { ...product.product, base_price: price } }, 400);
+    await request('/products/upload-image-url', admin.token, 'POST', { url: 'file:///test' }, 400);
+    const createdProduct = (await request('/products', admin.token, 'POST', product, 201)).data;
+    const productDetail = (await request(`/products/admin/${createdProduct.product_id}`, admin.token)).data;
+    await request(`/products/${createdProduct.product_id}`, admin.token, 'PUT', { ...product, product: { ...product.product, product_name: 'Updated audit product' }, variants: [{ ...product.variants[0], variant_id: productDetail.variants[0].variant_id }] });
+    await request(`/products/${createdProduct.product_id}`, admin.token, 'DELETE');
+    await request(`/products/${createdProduct.product_id}`, admin.token, 'DELETE', undefined, 404);
+    const faq = (await request('/faqs', admin.token, 'POST', { question: 'Audit FAQ?', answer: 'Audit answer' })).data;
+    await request(`/faqs/${faq.faq_id}`, admin.token, 'PUT', { question: 'Updated FAQ?', answer: 'Updated answer', is_active: 0 });
+    await request(`/faqs/${faq.faq_id}`, admin.token, 'DELETE');
+    await request(`/faqs/${faq.faq_id}`, admin.token, 'DELETE', undefined, 404);
+    const promo = { promo_code: 'AUDITCRUD', promo_name: 'Audit promotion', discount_type: 'percent', discount_value: 10, channel_scope: 'both', start_date: '2020-01-01 00:00:00', end_date: '2035-01-01 00:00:00' };
+    await request('/promotions', admin.token, 'POST', { ...promo, discount_value: 101 }, 400);
+    await request('/promotions', admin.token, 'POST', promo);
+    const promotions = (await request('/promotions', admin.token)).data;
+    const id = promotions.find(row => row.promo_code === promo.promo_code).promotion_id;
+    await request(`/promotions/${id}`, admin.token, 'PUT', { ...promo, discount_value: 15 });
+    await request(`/promotions/${id}`, admin.token, 'DELETE');
+    await request(`/promotions/${id}`, admin.token, 'DELETE', undefined, 404);
+    await request(`/branches/${missing}`, admin.token, 'PUT', { branch_name: 'Missing branch' }, 404);
+    await request(`/branches/${missing}/status`, admin.token, 'PATCH', { is_active: true }, 404);
+    const branch = (await request('/branches', admin.token, 'POST', { branch_name: 'CRUD branch', address: 'Test address' }, 201)).data;
+    await request(`/branches/${branch.branch_id}`, admin.token, 'PUT', { branch_name: 'Updated CRUD branch', address: 'Updated address', latitude: 0, longitude: 0 });
+    await request(`/branches/${branch.branch_id}/status`, admin.token, 'PATCH', { is_active: false });
+    await request(`/accounts/${missing}`, admin.token, 'PUT', { full_name: 'Missing staff', role_id: 2, branch_id: 1 }, 404);
+    await request(`/accounts/${missing}/status`, admin.token, 'PATCH', { is_active: true }, 404);
+    const account = (await request('/accounts', admin.token, 'POST', { full_name: 'CRUD staff', email: 'crud-staff@example.invalid', password: 'AuditStaff123!', role_id: 2, branch_id: 1 }, 201)).data;
+    await request(`/accounts/${account.id}`, admin.token, 'PUT', { full_name: 'Updated CRUD staff', role_id: 2, branch_id: 2 });
+    await request(`/accounts/${account.id}/status`, admin.token, 'PATCH', { is_active: false });
+    await request('/customers', staff.token, 'POST', { full_name: {}, phone: 'bad' }, 400);
+    await request('/customers', staff.token, 'POST', { full_name: 'Invalid customer', phone: '123' }, 400);
+    await request('/customers/1/status', admin.token, 'PATCH', { is_active: 'false' }, 400);
+    await request('/customers/me', customer.token, 'PUT', { full_name: {}, phone: null }, 400);
+    await request('/customers/me', customer.token, 'PUT', { full_name: 'Fixture customer', phone: '123' }, 400);
+    const createdCustomer = (await request('/customers', staff.token, 'POST', { full_name: 'CRUD customer', phone: '0900099999' }, 201)).data;
+    await request(`/customers/${createdCustomer.customer_id}/status`, admin.token, 'PATCH', { is_active: false });
+    const address = { recipient_name: 'CRUD customer', recipient_phone: '0900000001', full_address: 'Test address', city: 'Test city' };
+    await request('/addresses', customer.token, 'POST', address);
+    const addresses = (await request('/addresses', customer.token)).data;
+    const addressId = addresses.find(row => row.full_address === address.full_address).address_id;
+    await request(`/addresses/${addressId}`, otherCustomer.token, 'PUT', { ...address, is_default: true }, 404);
+    await request(`/addresses/${addressId}`, customer.token, 'PUT', { ...address, recipient_phone: '123' }, 400);
+    await request(`/addresses/${addressId}`, customer.token, 'PUT', { ...address, full_address: 'Updated test address' });
+    const updatedAddress = (await request('/addresses', customer.token)).data.find(row => row.address_id === addressId);
+    assert.equal(updatedAddress.full_address, 'Updated test address');
+    assert.equal(Number(updatedAddress.is_default), 1);
+    await request(`/addresses/${addressId}`, customer.token, 'DELETE');
+    await request(`/addresses/${addressId}`, customer.token, 'DELETE', undefined, 404);
+    const ownOrders = (await request('/customers/me/orders', customer.token)).data;
+    assert.ok(Array.isArray(ownOrders));
+    await request('/customers/me/orders', null, 'GET', undefined, 401);
+    console.log('PASS CRUD audit: attribute create/update/delete, repeated deletes, missing IDs, FAQ, promotions and contact validation');
+};

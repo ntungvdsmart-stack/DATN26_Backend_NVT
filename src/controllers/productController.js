@@ -3,6 +3,25 @@ const CategoryModel = require('../models/categoryModel');
 const BrandModel = require('../models/brandModel');
 const { sendResponse } = require('../utils/responseHelper');
 const cloudinary = require('cloudinary').v2;
+const validPrice = value => ['number', 'string'].includes(typeof value) && String(value).trim() !== '' && Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 9999999999.99;
+const validateProduct = ({ product, variants, images }) => {
+    if (!product || typeof product.product_name !== 'string' || product.product_name.trim().length < 2 || product.product_name.length > 200 || !Number.isSafeInteger(Number(product.category_id)) || Number(product.category_id) <= 0) return 'Tên sản phẩm 2–200 ký tự và danh mục hợp lệ là bắt buộc';
+    if (!validPrice(product.base_price)) return 'Giá sản phẩm phải là số không âm hợp lệ';
+    if (product.description != null && (typeof product.description !== 'string' || product.description.length > 20000)) return 'Mô tả sản phẩm tối đa 20.000 ký tự';
+    if (product.is_active != null && ![true, false, 0, 1].includes(product.is_active)) return 'Trạng thái sản phẩm không hợp lệ';
+    if (!Array.isArray(variants) || variants.length === 0 || variants.length > 500) return 'Cần từ 1 đến 500 biến thể';
+    const skus = new Set();
+    for (const variant of variants) {
+        if (!variant || (variant.sku != null && (typeof variant.sku !== 'string' || variant.sku.length > 50))) return 'SKU tối đa 50 ký tự';
+        const sku = variant.sku?.trim().toLowerCase();
+        if (sku && skus.has(sku)) return 'SKU không được trùng nhau';
+        if (sku) skus.add(sku);
+        if (!validPrice(variant.price) || !Number.isSafeInteger(Number(variant.quantity ?? 0)) || Number(variant.quantity ?? 0) < 0) return 'Giá biến thể không âm; tồn kho là số nguyên không âm';
+        if (variant.size_description != null && (typeof variant.size_description !== 'string' || variant.size_description.length > 10000)) return 'Mô tả size tối đa 10.000 ký tự';
+    }
+    if (images != null && (!Array.isArray(images) || images.length > 30 || images.some(image => !image || typeof image.url !== 'string' || image.url.length > 1000 || !/^(https?:\/\/|\/uploads\/)/i.test(image.url)))) return 'Danh sách ảnh không hợp lệ';
+    return null;
+};
 
 const extractPublicId = (url) => {
     if (!url || !url.includes('cloudinary.com')) return null;
@@ -22,9 +41,9 @@ const ProductController = {
             const pool = require('../config/database');
             const [[categories], [brands], [sizes], [colors], [materials]] = await Promise.all([
                 pool.query(`
-                    SELECT c.category_id, c.category_name, p.category_name as parent_name
+                    SELECT c.*, p.category_name as parent_name
                     FROM categories c LEFT JOIN categories p ON c.parent_id = p.category_id
-                    ORDER BY COALESCE(c.parent_id, c.category_id), c.sort_order
+                    ORDER BY COALESCE(c.parent_id, c.category_id), c.category_name
                 `),
                 pool.query('SELECT brand_id, brand_name FROM brands ORDER BY brand_name'),
                 pool.query(`SELECT size_id, size_value FROM sizes 
@@ -53,7 +72,7 @@ const ProductController = {
             if (!category_name) {
                 return sendResponse(res, 400, false, 'Tên danh mục là bắt buộc');
             }
-            const category_id = await CategoryModel.create(category_name, parent_id);
+            const category_id = await CategoryModel.create(category_name, parent_id, req.body);
             sendResponse(res, 201, true, 'Tạo danh mục thành công', { category_id, category_name, parent_id });
         } catch (error) {
             next(error);
@@ -67,7 +86,7 @@ const ProductController = {
             if (!category_name) {
                 return sendResponse(res, 400, false, 'Tên danh mục là bắt buộc');
             }
-            await CategoryModel.update(id, category_name, parent_id);
+            await CategoryModel.update(id, category_name, parent_id, req.body);
             sendResponse(res, 200, true, 'Cập nhật danh mục thành công');
         } catch (error) {
             next(error);
@@ -77,11 +96,11 @@ const ProductController = {
     deleteCategory: async (req, res, next) => {
         try {
             const { id } = req.params;
-            await CategoryModel.delete(id);
+            if (!await CategoryModel.delete(id, req.user.id)) return sendResponse(res, 404, false, 'Không tìm thấy dữ liệu');
             sendResponse(res, 200, true, 'Xóa danh mục thành công');
         } catch (error) {
             if (error.code === 'ER_ROW_IS_REFERENCED_2') {
-                return sendResponse(res, 400, false, 'Không thể xóa danh mục vì đang có sản phẩm thuộc danh mục này');
+                return sendResponse(res, 400, false, 'Không thể xóa danh mục đang có danh mục con hoặc sản phẩm. Hãy chuyển các dữ liệu này sang danh mục khác trước');
             }
             next(error);
         }
@@ -110,7 +129,7 @@ const ProductController = {
             if (!brand_name) {
                 return sendResponse(res, 400, false, 'Tên thương hiệu là bắt buộc');
             }
-            await BrandModel.update(id, brand_name);
+            if (!await BrandModel.update(id, brand_name)) return sendResponse(res, 404, false, 'Không tìm thấy dữ liệu');
             sendResponse(res, 200, true, 'Cập nhật thương hiệu thành công');
         } catch (error) {
             if (error.code === 'ER_DUP_ENTRY') {
@@ -123,7 +142,7 @@ const ProductController = {
     deleteBrand: async (req, res, next) => {
         try {
             const { id } = req.params;
-            await BrandModel.delete(id);
+            if (!await BrandModel.delete(id, req.user.id)) return sendResponse(res, 404, false, 'Không tìm thấy dữ liệu');
             sendResponse(res, 200, true, 'Xóa thương hiệu thành công');
         } catch (error) {
             if (error.code === 'ER_ROW_IS_REFERENCED_2') {
@@ -158,7 +177,7 @@ const ProductController = {
                 return sendResponse(res, 400, false, 'Giá trị Size là bắt buộc');
             }
             const SizeModel = require('../models/sizeModel');
-            await SizeModel.update(id, size_value);
+            if (!await SizeModel.update(id, size_value)) return sendResponse(res, 404, false, 'Không tìm thấy dữ liệu');
             sendResponse(res, 200, true, 'Cập nhật Size thành công');
         } catch (error) {
             if (error.code === 'ER_DUP_ENTRY') {
@@ -172,7 +191,7 @@ const ProductController = {
         try {
             const { id } = req.params;
             const SizeModel = require('../models/sizeModel');
-            await SizeModel.delete(id);
+            if (!await SizeModel.delete(id, req.user.id)) return sendResponse(res, 404, false, 'Không tìm thấy dữ liệu');
             sendResponse(res, 200, true, 'Xóa Size thành công');
         } catch (error) {
             if (error.code === 'ER_ROW_IS_REFERENCED_2') {
@@ -201,7 +220,7 @@ const ProductController = {
             const { color_name, hex_code } = req.body;
             if (!color_name) return sendResponse(res, 400, false, 'Tên màu là bắt buộc');
             const ColorModel = require('../models/colorModel');
-            await ColorModel.update(id, color_name, hex_code);
+            if (!await ColorModel.update(id, color_name, hex_code)) return sendResponse(res, 404, false, 'Không tìm thấy dữ liệu');
             sendResponse(res, 200, true, 'Cập nhật màu thành công');
         } catch (error) {
             if (error.code === 'ER_DUP_ENTRY') return sendResponse(res, 400, false, 'Màu này đã tồn tại');
@@ -212,7 +231,7 @@ const ProductController = {
         try {
             const { id } = req.params;
             const ColorModel = require('../models/colorModel');
-            await ColorModel.delete(id);
+            if (!await ColorModel.delete(id, req.user.id)) return sendResponse(res, 404, false, 'Không tìm thấy dữ liệu');
             sendResponse(res, 200, true, 'Xóa màu thành công');
         } catch (error) {
             if (error.code === 'ER_ROW_IS_REFERENCED_2') return sendResponse(res, 400, false, 'Không thể xóa màu vì đang có sản phẩm dùng màu này');
@@ -239,7 +258,7 @@ const ProductController = {
             const { material_name } = req.body;
             if (!material_name) return sendResponse(res, 400, false, 'Tên chất liệu là bắt buộc');
             const MaterialModel = require('../models/materialModel');
-            await MaterialModel.update(id, material_name);
+            if (!await MaterialModel.update(id, material_name)) return sendResponse(res, 404, false, 'Không tìm thấy dữ liệu');
             sendResponse(res, 200, true, 'Cập nhật chất liệu thành công');
         } catch (error) {
             if (error.code === 'ER_DUP_ENTRY') return sendResponse(res, 400, false, 'Chất liệu này đã tồn tại');
@@ -250,7 +269,7 @@ const ProductController = {
         try {
             const { id } = req.params;
             const MaterialModel = require('../models/materialModel');
-            await MaterialModel.delete(id);
+            if (!await MaterialModel.delete(id, req.user.id)) return sendResponse(res, 404, false, 'Không tìm thấy dữ liệu');
             sendResponse(res, 200, true, 'Xóa chất liệu thành công');
         } catch (error) {
             if (error.code === 'ER_ROW_IS_REFERENCED_2') return sendResponse(res, 400, false, 'Không thể xóa chất liệu vì đang có sản phẩm dùng chất liệu này');
@@ -280,7 +299,7 @@ const ProductController = {
     uploadImageUrl: async (req, res, next) => {
         try {
             const { url } = req.body;
-            if (!url) return sendResponse(res, 400, false, 'Thiếu URL ảnh');
+            if (typeof url !== 'string' || url.length > 2048 || !/^https?:\/\//i.test(url)) return sendResponse(res, 400, false, 'URL ảnh phải là địa chỉ HTTP hoặc HTTPS hợp lệ');
 
             const result = await cloudinary.uploader.upload(url, {
                 folder: 'fashionOS/products',
@@ -295,18 +314,7 @@ const ProductController = {
                 is_primary: true
             }];
             sendResponse(res, 200, true, 'Tải ảnh từ URL thành công', uploaded);
-        } catch (error) {
-            console.error('Lỗi upload từ URL:', error.message);
-            // Giả lập trả về ảnh lỗi Cloudinary
-            const uploaded = [{
-                url: 'https://placehold.co/400x500/f3f4f6/9ca3af?text=Lỗi+Tài+Khoản',
-                filename: `fallback-${Date.now()}`,
-                originalName: 'url-image-error',
-                size: 0,
-                is_primary: true
-            }];
-            sendResponse(res, 200, true, 'Tải ảnh (dùng dự phòng) thành công', uploaded);
-        }
+        } catch (error) { next(error); }
     },
 
     // ── Danh sách sản phẩm (Admin) ──
@@ -320,7 +328,7 @@ const ProductController = {
     // ── Chi tiết sản phẩm (Admin) ──
     getProductDetails: async (req, res, next) => {
         try {
-            const product = await ProductModel.getById(req.params.id);
+            const product = await ProductModel.getById(req.params.id, req.user.branch_id || 1);
             if (!product) return sendResponse(res, 404, false, 'Không tìm thấy sản phẩm');
             sendResponse(res, 200, true, 'OK', product);
         } catch (error) { next(error); }
@@ -347,6 +355,8 @@ const ProductController = {
     createProduct: async (req, res, next) => {
         try {
             const { product, variants, images } = req.body;
+            const validation = validateProduct(req.body);
+            if (validation) return sendResponse(res, 400, false, validation);
             if (!product?.product_name || !product?.category_id)
                 return sendResponse(res, 400, false, 'Tên sản phẩm và Danh mục là bắt buộc');
             if (!variants || variants.length === 0)
@@ -366,6 +376,8 @@ const ProductController = {
         try {
             const { id } = req.params;
             const { product, variants, images } = req.body;
+            const validation = validateProduct(req.body);
+            if (validation) return sendResponse(res, 400, false, validation);
             if (!product?.product_name || !product?.category_id)
                 return sendResponse(res, 400, false, 'Tên sản phẩm và Danh mục là bắt buộc');
 
@@ -403,6 +415,7 @@ const ProductController = {
 
             // Xóa ảnh trên Cloudinary
             const images = product.images || [];
+            await ProductModel.delete(req.params.id, req.user.id);
             for (const img of images) {
                 const publicId = extractPublicId(img.image_url);
                 if (publicId) {
@@ -410,7 +423,6 @@ const ProductController = {
                 }
             }
 
-            await ProductModel.delete(req.params.id, req.user.id);
             sendResponse(res, 200, true, 'Xóa sản phẩm thành công');
         } catch (error) {
             if (error.statusCode === 404)
@@ -423,7 +435,7 @@ const ProductController = {
     deleteVariant: async (req, res, next) => {
         try {
             const { id, variantId } = req.params;
-            const deleted = await ProductModel.deleteVariant(variantId, id);
+            const deleted = await ProductModel.deleteVariant(variantId, id, req.user.id);
             if (!deleted)
                 return sendResponse(res, 404, false, 'Không tìm thấy biến thể này');
             sendResponse(res, 200, true, 'Xóa biến thể thành công');
@@ -434,9 +446,9 @@ const ProductController = {
     toggleProductStatus: async (req, res, next) => {
         try {
             const { is_active } = req.body;
-            if (is_active === undefined)
+            if (![true,false,0,1].includes(is_active))
                 return sendResponse(res, 400, false, 'Thiếu is_active');
-            await ProductModel.toggleStatus(req.params.id, is_active ? 1 : 0);
+            if (!await ProductModel.toggleStatus(req.params.id, is_active ? 1 : 0)) return sendResponse(res, 404, false, 'Không tìm thấy sản phẩm');
             sendResponse(res, 200, true, `Đã ${is_active ? 'mở bán' : 'ngừng bán'} sản phẩm`);
         } catch (error) { next(error); }
     },
